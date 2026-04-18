@@ -88,7 +88,7 @@ def chi_square_test(wins_a: int, wins_b: int, draws: int) -> tuple[float, float,
             return 0.0, 1.0, False
         expected = total_decisive / 2.0
         stat, p = chisquare([wins_a, wins_b], f_exp=[expected, expected])
-        return float(stat), float(p), bool(p < 0.05)
+        return float(stat), float(p), p < 0.05
     except ImportError:
         pass
 

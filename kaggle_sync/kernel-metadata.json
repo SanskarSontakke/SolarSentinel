@@ -5,13 +5,13 @@
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
-  "enable_gpu": true,
-  "enable_tpu": false,
+  "enable_gpu": false,
+  "enable_tpu": true,
   "enable_internet": true,
   "keywords": [],
   "dataset_sources": [],
   "kernel_sources": [],
   "competition_sources": [],
   "model_sources": [],
-  "machine_shape": "NvidiaTeslaT4"
+  "machine_shape": "TpuV5Lite"
 }

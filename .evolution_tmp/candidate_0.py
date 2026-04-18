@@ -523,19 +523,19 @@ def select_best_move_set(candidates, sim_state, player, CFG):
 
 def agent(obs, override_config=None):
     CFG = {
-        "enemy_multiplier": 1.8500,
-        "finishing_multiplier": 2.2000,
-        "early_neutral_multiplier": 1.9000,
-        "safe_neutral_early_multiplier": 1.2500,
-        "contested_neutral_penalty": 0.3500,
-        "prod_weight": 19.0000,
-        "iw_weight": 2.0000,
-        "contested_margin": 1.8000,
-        "cost_turns_weight": 0.3500,
-        "funnel_finishing_ratio": 0.7500,
-        "funnel_ratio": 0.6000,
-        "sim_horizon": 30.0,
-        "fleet_discount": 0.9500,
+        "enemy_multiplier": 1.850000,
+        "finishing_multiplier": 2.200000,
+        "early_neutral_multiplier": 1.900000,
+        "safe_neutral_early_multiplier": 1.250000,
+        "contested_neutral_penalty": 0.350000,
+        "prod_weight": 19.000000,
+        "iw_weight": 2.000000,
+        "contested_margin": 1.800000,
+        "cost_turns_weight": 0.350000,
+        "funnel_finishing_ratio": 0.750000,
+        "funnel_ratio": 0.600000,
+        "sim_horizon": 30.000000,
+        "fleet_discount": 0.950000,
     }
     if override_config is not None:
         CFG.update(override_config)

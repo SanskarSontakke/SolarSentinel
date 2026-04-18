@@ -1,24 +1,109 @@
 {
-  "timestamp": "2026-04-18T06:29:43.422802+00:00",
+  "timestamp": "2026-04-18T12:02:40.776750+00:00",
   "agent_a": "submission.py",
   "agent_b": "snapshots/agent_v0.py",
-  "mode": "4p",
-  "total_games": 30,
-  "wins_a": 8,
-  "wins_b": 22,
+  "mode": "2p",
+  "total_games": 10,
+  "wins_a": 10,
+  "wins_b": 0,
   "draws": 0,
-  "winrate_a": 0.2932,
+  "winrate_a": 0.8612,
   "winrate_a_ci": [
-    0.1418,
-    0.4445
+    0.7225,
+    1.0
   ],
-  "winrate_b": 0.7068,
+  "winrate_b": 0.1388,
   "winrate_b_ci": [
-    0.5555,
-    0.8582
+    0.0,
+    0.2775
   ],
-  "avg_ship_lead": -2042.6,
-  "avg_game_length": 327.2,
-  "chi2": 6.5333,
-  "p_value": 0.0106,
-  "significant": 
+  "avg_ship_lead": 15831.6,
+  "avg_game_length": 373.4,
+  "chi2": 10.0,
+  "p_value": 0.0016,
+  "significant": true,
+  "verdict": "A is BETTER",
+  "elapsed_seconds": 90.7,
+  "per_game_results": [
+    {
+      "outcome": "A",
+      "ships_a": 8825,
+      "ships_b": 0,
+      "ship_lead": 8825,
+      "game_length": 277,
+      "a_slot": 0
+    },
+    {
+      "outcome": "A",
+      "ships_a": 26863,
+      "ships_b": 0,
+      "ship_lead": 26863,
+      "game_length": 491,
+      "a_slot": 1
+    },
+    {
+      "outcome": "A",
+      "ships_a": 10187,
+      "ships_b": 0,
+      "ship_lead": 10187,
+      "game_length": 277,
+      "a_slot": 0
+    },
+    {
+      "outcome": "A",
+      "ships_a": 10352,
+      "ships_b": 0,
+      "ship_lead": 10352,
+      "game_length": 315,
+      "a_slot": 1
+    },
+    {
+      "outcome": "A",
+      "ships_a": 24417,
+      "ships_b": 44,
+      "ship_lead": 24373,
+      "game_length": 499,
+      "a_slot": 0
+    },
+    {
+      "outcome": "A",
+      "ships_a": 18727,
+      "ships_b": 17,
+      "ship_lead": 18710,
+      "game_length": 499,
+      "a_slot": 1
+    },
+    {
+      "outcome": "A",
+      "ships_a": 4870,
+      "ships_b": 0,
+      "ship_lead": 4870,
+      "game_length": 267,
+      "a_slot": 0
+    },
+    {
+      "outcome": "A",
+      "ships_a": 2247,
+      "ships_b": 0,
+      "ship_lead": 2247,
+      "game_length": 174,
+      "a_slot": 1
+    },
+    {
+      "outcome": "A",
+      "ships_a": 45605,
+      "ships_b": 47,
+      "ship_lead": 45558,
+      "game_length": 499,
+      "a_slot": 0
+    },
+    {
+      "outcome": "A",
+      "ships_a": 6331,
+      "ships_b": 0,
+      "ship_lead": 6331,
+      "game_length": 436,
+      "a_slot": 1
+    }
+  ]
+}

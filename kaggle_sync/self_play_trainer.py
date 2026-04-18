@@ -275,27 +275,23 @@ PARAM_SPACE = {
     "cost_turns_weight":             (0.1, 2.0),
     "funnel_finishing_ratio":        (0.5, 0.95),
     "funnel_ratio":                  (0.3, 0.85),
-    "sim_horizon":                   (10.0, 60.0),
-    "fleet_discount":                (0.8, 1.0),
 }
 
 PARAM_NAMES = list(PARAM_SPACE.keys())
 
 # ── Current defaults (read from submission.py at startup) ─────────────────────
 DEFAULT_CFG = {
-    "enemy_multiplier": 1.85,
-    "finishing_multiplier": 2.2,
-    "early_neutral_multiplier": 1.9,
-    "safe_neutral_early_multiplier": 1.25,
-    "contested_neutral_penalty": 0.35,
-    "prod_weight": 19.0,
-    "iw_weight": 2.0,
-    "contested_margin": 1.8,
-    "cost_turns_weight": 0.35,
-    "funnel_finishing_ratio": 0.75,
-    "funnel_ratio": 0.60,
-    "sim_horizon": 30.0,
-    "fleet_discount": 0.95,
+    "enemy_multiplier": 2.0,
+    "finishing_multiplier": 1.5,
+    "early_neutral_multiplier": 1.6,
+    "safe_neutral_early_multiplier": 1.4,
+    "contested_neutral_penalty": 0.25,
+    "prod_weight": 15.0,
+    "iw_weight": 3.0,
+    "contested_margin": 1.4,
+    "cost_turns_weight": 0.5,
+    "funnel_finishing_ratio": 0.80,
+    "funnel_ratio": 0.65,
 }
 
 

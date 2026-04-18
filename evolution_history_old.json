@@ -1,0 +1,76 @@
+{
+  "best_cfg": {
+    "enemy_multiplier": 2.778990881977415,
+    "finishing_multiplier": 1.431631525407075,
+    "early_neutral_multiplier": 1.0959061138224833,
+    "safe_neutral_early_multiplier": 0.9795145799974678,
+    "contested_neutral_penalty": 0.3963833772605577,
+    "prod_weight": 20.574406284025816,
+    "iw_weight": 4.222097103686688,
+    "contested_margin": 1.1005206317200875,
+    "cost_turns_weight": 0.6323319541480302,
+    "funnel_finishing_ratio": 0.8157525842339983,
+    "funnel_ratio": 0.6860836184602872
+  },
+  "best_score": -12.582,
+  "history": [
+    {
+      "generation": 1,
+      "best_score": -12.58,
+      "global_best_score": -12.58,
+      "sigma": 0.285,
+      "stagnation": 0,
+      "best_cfg": {
+        "enemy_multiplier": 2.778991,
+        "finishing_multiplier": 1.431632,
+        "early_neutral_multiplier": 1.095906,
+        "safe_neutral_early_multiplier": 0.979515,
+        "contested_neutral_penalty": 0.396383,
+        "prod_weight": 20.574406,
+        "iw_weight": 4.222097,
+        "contested_margin": 1.100521,
+        "cost_turns_weight": 0.632332,
+        "funnel_finishing_ratio": 0.815753,
+        "funnel_ratio": 0.686084
+      },
+      "all_scores": [
+        -115.85,
+        -27.09,
+        -25.27,
+        -88.05,
+        -58.3,
+        -12.58
+      ],
+      "elapsed_s": 95.3
+    },
+    {
+      "generation": 2,
+      "best_score": -18.44,
+      "global_best_score": -12.58,
+      "sigma": 0.27075,
+      "stagnation": 1,
+      "best_cfg": {
+        "enemy_multiplier": 1.282411,
+        "finishing_multiplier": 1.950271,
+        "early_neutral_multiplier": 2.164339,
+        "safe_neutral_early_multiplier": 0.8,
+        "contested_neutral_penalty": 0.05,
+        "prod_weight": 15.958803,
+        "iw_weight": 2.288454,
+        "contested_margin": 1.392439,
+        "cost_turns_weight": 0.1,
+        "funnel_finishing_ratio": 0.918719,
+        "funnel_ratio": 0.778336
+      },
+      "all_scores": [
+        -57.85,
+        -18.44,
+        -68.92,
+        -41.01,
+        -110.07,
+        -35.83
+      ],
+      "elapsed_s": 115.6
+    }
+  ]
+}
