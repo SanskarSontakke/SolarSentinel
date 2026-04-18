@@ -14,18 +14,6 @@ Hybrid architecture (best of references 5, 6, 8):
   - Indirect wealth scoring (ref 5/6)
 """
 
-import logging
-import warnings
-
-# Force silence all INFO logs from kaggle_environments and absl
-logging.getLogger("kaggle_environments").setLevel(logging.WARNING)
-try:
-    from absl import logging as absl_logging
-    absl_logging.set_verbosity(absl_logging.ERROR)
-except ImportError:
-    pass
-logging.disable(logging.INFO)
-warnings.filterwarnings("ignore")
 import math
 from collections import defaultdict
 
@@ -378,154 +366,24 @@ def _reaction_time(tgt, my_planets, enemy_planets):
     return my_t, en_t
 
 
-# ═══ Forward Simulation ═══════════════════════════════════════════════════════
-
-class SimFleet:
-    __slots__ = ['owner', 'target_id', 'ships', 'eta']
-    def __init__(self, owner, target_id, ships, eta):
-        self.owner = owner
-        self.target_id = target_id
-        self.ships = ships
-        self.eta = eta
-
-class SimState:
-    __slots__ = ['planets', 'fleets', 'geo']
-    
-    def __init__(self):
-        self.planets = {}  # pid -> [owner, ships, production]
-        self.fleets = []   # SimFleet list
-        self.geo = {}      # pid -> (x, y)
-        
-    def clone(self):
-        c = SimState()
-        c.planets = {k: v.copy() for k, v in self.planets.items()}
-        c.fleets = [SimFleet(f.owner, f.target_id, f.ships, f.eta) for f in self.fleets]
-        c.geo = self.geo
-        return c
-        
-    def step(self):
-        for pid, pdata in self.planets.items():
-            if pdata[0] != -1:
-                pdata[1] += pdata[2]
-                
-        for f in self.fleets:
-            f.eta -= 1
-            
-        arriving = [f for f in self.fleets if f.eta <= 0]
-        self.fleets = [f for f in self.fleets if f.eta > 0]
-        
-        if not arriving:
-            return
-            
-        arrivals_by_planet = defaultdict(list)
-        for f in arriving:
-            arrivals_by_planet[f.target_id].append(f)
-            
-        for pid, arriving_fleets in arrivals_by_planet.items():
-            if pid not in self.planets: continue
-            pdata = self.planets[pid]
-            current_owner = pdata[0]
-            
-            forces = defaultdict(int)
-            for f in arriving_fleets:
-                forces[f.owner] += f.ships
-            forces[current_owner] += pdata[1]
-            
-            if not forces: continue
-            
-            sorted_forces = sorted(forces.items(), key=lambda x: x[1], reverse=True)
-            if len(sorted_forces) == 1:
-                pdata[0] = sorted_forces[0][0]
-                pdata[1] = sorted_forces[0][1]
-            else:
-                rem = sorted_forces[0][1] - sorted_forces[1][1]
-                pdata[1] = rem
-                if rem > 0:
-                    pdata[0] = sorted_forces[0][0]
-
-def evaluate_moves(moves_list, sim_state, player, horizon=5):
-    state = sim_state.clone()
-    
-    for move in moves_list:
-        if len(move) >= 5:
-            src_id, ang, ships, target_id, eta = move[:5]
-        else:
-            src_id, angle, ships = move
-            src_x, src_y = state.geo[src_id]
-            target_id = None
-            best_dist = 1e9
-            cx, cy = math.cos(angle), math.sin(angle)
-            for pid, (px, py) in state.geo.items():
-                if pid == src_id: continue
-                dx, dy = px - src_x, py - src_y
-                dist = math.hypot(dx, dy)
-                if dist < 1e-4: continue
-                if (dx * cx + dy * cy) / dist > 0.999:
-                    if dist < best_dist:
-                        best_dist = dist
-                        target_id = pid
-            eta = max(1, math.ceil(best_dist / 6.0)) if target_id is not None else 1000
-            
-        if target_id is not None:
-            state.fleets.append(SimFleet(player, target_id, ships, eta))
-            if src_id in state.planets and state.planets[src_id][0] == player:
-                state.planets[src_id][1] = max(0, state.planets[src_id][1] - ships)
-
-    for _ in range(horizon):
-        state.step()
-        
-    my_score = 0
-    en_score = 0
-    for pid, pdata in state.planets.items():
-        owner, ships, prod = pdata
-        val = ships + 40 * prod
-        if owner == player:
-            my_score += val
-        elif owner != -1:
-            en_score += val
-            
-    return my_score - en_score
-
-def select_best_move_set(candidates, sim_state, player):
-    if not candidates:
-        return []
-        
-    import time as _time_mod
-    t0 = _time_mod.time()
-    best_score = -1e9
-    best_moves = candidates[0]
-    
-    for moves_list in candidates:
-        score = evaluate_moves(moves_list, sim_state, player, horizon=5)
-        if score > best_score:
-            best_score = score
-            best_moves = moves_list
-            
-        if (_time_mod.time() - t0) > 0.150: # Leave some buffer for the 200ms limit
-            break
-            
-    return [[m[0], float(m[1]), int(m[2])] for m in best_moves]
 # ═══ Main Agent ═══════════════════════════════════════════════════════════════
 
 def agent(obs, override_config=None):
     CFG = {
-        "enemy_multiplier": 2.0000,
-        "finishing_multiplier": 1.5000,
-        "early_neutral_multiplier": 1.6000,
-        "safe_neutral_early_multiplier": 1.4000,
-        "contested_neutral_penalty": 0.2500,
-        "prod_weight": 15.0000,
-        "iw_weight": 3.0000,
-        "contested_margin": 1.4000,
-        "cost_turns_weight": 0.5000,
-        "funnel_finishing_ratio": 0.8000,
-        "funnel_ratio": 0.6500,
+        "enemy_multiplier": 2.0,
+        "finishing_multiplier": 1.5,
+        "early_neutral_multiplier": 1.6,
+        "safe_neutral_early_multiplier": 1.4,
+        "contested_neutral_penalty": 0.25,
+        "prod_weight": 15.0,
+        "iw_weight": 3.0,
+        "contested_margin": 1.4,
+        "cost_turns_weight": 0.5,
+        "funnel_finishing_ratio": 0.80,
+        "funnel_ratio": 0.65,
     }
     if override_config is not None:
         CFG.update(override_config)
-
-    import time as _time_mod
-    _agent_t0 = _time_mod.time()
 
     # ── Parse observation ─────────────────────────────────────────────────────
     if isinstance(obs, dict):
@@ -542,18 +400,6 @@ def agent(obs, override_config=None):
     comets    = get("comets", []) or []
     comet_ids = set(get("comet_planet_ids", []) or [])
     p_by_id   = {p.id: p for p in planets}
-
-    sim_state = SimState()
-    for p in planets:
-        sim_state.planets[p.id] = [p.owner, p.ships, p.production]
-        sim_state.geo[p.id] = (p.x, p.y)
-    for f in fleets:
-        target_p, t = _fleet_dest(f, planets)
-        if target_p:
-            sim_state.fleets.append(SimFleet(f.owner, target_p.id, f.ships, t))
-
-    n_players = len(set(p.owner for p in planets if p.owner != -1)) + len(set(f.owner for f in fleets if f.owner != -1))
-    is_4p = (n_players > 2) or (player > 1)
 
     mine    = [p for p in planets if p.owner == player]
     if not mine:
@@ -574,46 +420,7 @@ def agent(obs, override_config=None):
     my_prod  = sum(p.production for p in mine)
     en_prod  = sum(p.production for p in enemy)
     dom      = (my_ships - en_ships) / max(1, my_ships + en_ships)
-    
-    dying_player = -1
-    strongest_player = -1
-    kingmaker_protected = set()
-    vulture_targets = []
-
-    if is_4p:
-        enemy_stats = {}
-        for p in enemy:
-            enemy_stats[p.owner] = enemy_stats.get(p.owner, 0) + p.ships
-        for f in fleets:
-            if f.owner not in (-1, player):
-                enemy_stats[f.owner] = enemy_stats.get(f.owner, 0) + int(f.ships)
-
-        enemy_planet_owners = set(p.owner for p in enemy)
-        for e_owner, e_ships in enemy_stats.items():
-            if e_owner not in enemy_planet_owners and e_ships > 0:
-                for f in fleets:
-                    if f.owner == e_owner:
-                        tgt_p, t = _fleet_dest(f, planets)
-                        if tgt_p:
-                            vulture_targets.append(tgt_p.id)
-
-        sorted_enemies = sorted(enemy_stats.items(), key=lambda x: x[1])
-        if sorted_enemies:
-            strongest_player = sorted_enemies[-1][0]
-            if len(sorted_enemies) >= 2:
-                if sorted_enemies[0][1] < 0.5 * sorted_enemies[1][1]:
-                    dying_player = sorted_enemies[0][0]
-                
-                second_strongest_ships = sorted_enemies[-2][1]
-                if my_ships > 1.3 * second_strongest_ships:
-                    for e_owner, e_ships in sorted_enemies:
-                        if e_ships < my_ships and e_owner != sorted_enemies[-2][0] and e_owner != strongest_player:
-                            kingmaker_protected.add(e_owner)
-                            
-        finishing = dom > 0.25 and my_prod > (en_prod * 0.5) and step > 150
-    else:
-        finishing = dom > 0.35 and my_prod > en_prod * 1.3 and step > 100
-
+    finishing = dom > 0.35 and my_prod > en_prod * 1.3 and step > 100
     behind   = dom < -0.25
 
     # ── Fleet arrivals ────────────────────────────────────────────────────────
@@ -713,9 +520,6 @@ def agent(obs, override_config=None):
         src_ships = avail[src.id]
 
         for tgt in tgts:
-            if is_4p and tgt.owner in kingmaker_protected:
-                continue
-
             my_dist = _dist(src.x, src.y, tgt.x, tgt.y)
             if my_dist > 140:
                 continue
@@ -768,12 +572,6 @@ def agent(obs, override_config=None):
                     value *= CFG["finishing_multiplier"]
                 if tgt.ships < 15:
                     value += 500
-                    
-                if is_4p:
-                    if tgt.owner == dying_player:
-                        value *= 0.6
-                    elif tgt.owner == strongest_player:
-                        value *= 1.4
             else:
                 # Neutral: contested avoidance
                 if enemy:
@@ -785,20 +583,9 @@ def agent(obs, override_config=None):
                 else:
                     if early:
                         value *= CFG["safe_neutral_early_multiplier"]
-                        
-                if is_4p and dying_player != -1:
-                    # distance to dying player's center of mass roughly
-                    dying_planets = [p for p in enemy if p.owner == dying_player]
-                    if dying_planets:
-                        closest_dying = min((_dist(tgt.x, tgt.y, dp.x, dp.y) for dp in dying_planets), default=1e9)
-                        if closest_dying < my_dist + 20: 
-                            value *= 0.5   # Dying player is near, they'll drop it soon anyway
 
             cost = ships_needed + turns * CFG["cost_turns_weight"]
             score = value / (cost + 1.0)
-            
-            if is_4p and tgt.id in vulture_targets:
-                score *= 2.0
 
             # Bonuses
             if early and tgt.owner == -1 and ships_needed <= 18:
@@ -811,7 +598,6 @@ def agent(obs, override_config=None):
     # ── Greedy dispatch from sorted matrix ────────────────────────────────────
     candidates.sort(key=lambda x: -x[0])
 
-    base_p2_records = []
     for score, sid, tid, ang, ships_needed, turns, value in candidates:
         already = target_commits.get(tid, 0)
         tgt = p_by_id[tid]
@@ -828,164 +614,13 @@ def agent(obs, override_config=None):
         if send < 1:
             continue
 
+        moves.append([sid, float(ang), int(send)])
         planet_dispatched[sid] = planet_dispatched.get(sid, 0) + send
         target_commits[tid] = already + send
-        base_p2_records.append((sid, float(ang), int(send), tid, turns, src_avail))
-
-    base_moves = list(moves)
-    orig_cand = list(base_moves)
-    alt_a_cand = list(base_moves)
-    alt_b_cand = list(base_moves)
-    
-    for sid, ang, send, tid, turns, src_avail in base_p2_records:
-        orig_cand.append([sid, ang, send, tid, turns])
-        
-        send_a = max(1, int(send * 0.70))
-        alt_a_cand.append([sid, ang, send_a, tid, turns])
-        
-        send_b = min(src_avail, int(send * 1.30))
-        alt_b_cand.append([sid, ang, send_b, tid, turns])
-        
-    best_moves = select_best_move_set([orig_cand, alt_a_cand, alt_b_cand], sim_state, player)
-    
-    # Rollback base_p2_records effects
-    for sid, ang, send, tid, turns, src_avail in base_p2_records:
-        planet_dispatched[sid] -= send
-        target_commits[tid] -= send
-        
-    moves = list(base_moves)
-    for i in range(len(base_moves), len(best_moves)):
-        sid, ang, send = best_moves[i]
-        moves.append([sid, ang, send])
-        planet_dispatched[sid] = planet_dispatched.get(sid, 0) + send
-        
-        # We don't have accurate 'tid' inside best_moves without matching or recomputing,
-        # but we can assume Alt targets match base_p2_records targets in order
-        m_idx = i - len(base_moves)
-        if m_idx < len(base_p2_records):
-            tid = base_p2_records[m_idx][3]
-            target_commits[tid] = target_commits.get(tid, 0) + send
 
     # Update avail
     for sid in planet_dispatched:
         avail[sid] = max(0, avail[sid] - planet_dispatched.get(sid, 0))
-
-    # ═══ PHASE 2b: Synchronized Swarm Planner ══════════════════════════════════
-    SYNC_WINDOW = 3
-
-    if not vlate and (_time_mod.time() - _agent_t0) < 0.400:
-        # Collect candidate swarm targets: enemy planets not already captured
-        swarm_targets = sorted(
-            [p for p in enemy],
-            key=lambda p: -(p.production * (1.5 if p.production >= 3 else 1.0)),
-        )
-
-        for tgt in swarm_targets:
-            # Time guard: skip if already over budget
-            if (_time_mod.time() - _agent_t0) > 0.400:
-                break
-
-            # Skip if already sufficiently committed from Phase 2
-            already_committed = target_commits.get(tgt.id, 0) + inbound_friendly.get(tgt.id, 0)
-            defender_at_max = _compute_defender(tgt, 80, arr[tgt.id], player) + 1
-            if already_committed >= defender_at_max:
-                continue
-
-            # Collect source planets that can reach target within 80 turns
-            sources = []
-            for src in mine:
-                src_avail = avail[src.id] - planet_dispatched.get(src.id, 0)
-                if src_avail < 2 or src.id in doomed:
-                    continue
-                if _crosses_sun(src.x, src.y, tgt.x, tgt.y):
-                    # still allow with waypoint angle from _safe_angle
-                    pass
-                aim = _aim_at(src, tgt, src_avail, init_map, av, comets, comet_ids)
-                if aim is None:
-                    continue
-                ang, turns, tx, ty = aim
-                if turns > 80:
-                    continue
-                if not _launch_clear(src.x, src.y, ang):
-                    continue
-                sources.append((src, ang, turns, src_avail, tx, ty))
-
-            if len(sources) < 2:
-                continue
-
-            # Group into sync windows by ETA proximity
-            sources.sort(key=lambda x: x[2])   # sort by turns
-            windows = []
-            for entry in sources:
-                placed = False
-                for w in windows:
-                    if abs(entry[2] - w[0][2]) <= SYNC_WINDOW:
-                        w.append(entry)
-                        placed = True
-                        break
-                if not placed:
-                    windows.append([entry])
-
-            # Score each window: total ships, with production priority bonus
-            prod_boost = 1.5 if tgt.production >= 3 else 1.0
-            best_window = None
-            best_window_ships = 0
-            for w in windows:
-                if len(w) < 2:
-                    continue
-                total_ships = sum(e[3] for e in w)
-                score = total_ships * prod_boost
-                if score > best_window_ships:
-                    best_window_ships = score
-                    best_window = w
-
-            if best_window is None:
-                continue
-
-            # Use the representative ETA (median of window)
-            window_eta = best_window[len(best_window) // 2][2]
-            needed = _compute_defender(tgt, window_eta, arr[tgt.id], player) + 1
-            window_total = sum(e[3] for e in best_window)
-
-            # Qualification check
-            is_pressure = False
-            if window_total >= needed:
-                pass  # Full capture: proceed normally
-            elif (tgt.production >= 4 and
-                  window_total >= needed * 0.60):
-                is_pressure = True   # Tempo play: pressure fleet
-            else:
-                continue  # Not enough — skip target
-
-            # Dispatch proportionally
-            ships_to_send = needed if not is_pressure else int(needed * 0.65)
-            commit_value  = ships_to_send if not is_pressure else int(ships_to_send * 0.5)
-
-            # Only dispatch if target not already handled
-            if target_commits.get(tgt.id, 0) + inbound_friendly.get(tgt.id, 0) >= (needed if not is_pressure else 1):
-                continue
-
-            dispatched_this_swarm = 0
-            for src, ang, turns, src_avail_ships, tx, ty in best_window:
-                if dispatched_this_swarm >= ships_to_send + 5:
-                    break
-                src_actual = avail[src.id] - planet_dispatched.get(src.id, 0)
-                if src_actual < 1:
-                    continue
-                # Proportional share of needed ships
-                proportion = src_avail_ships / max(1, window_total)
-                send = min(src_actual, max(1, int((ships_to_send + 5) * proportion)))
-                if send < 1:
-                    continue
-                moves.append([src.id, float(ang), int(send)])
-                planet_dispatched[src.id] = planet_dispatched.get(src.id, 0) + send
-                avail[src.id] = max(0, avail[src.id] - send)
-                dispatched_this_swarm += send
-
-            if dispatched_this_swarm > 0:
-                target_commits[tgt.id] = target_commits.get(tgt.id, 0) + commit_value
-                if is_pressure:
-                    pass  # Lower commit already set; don't block Phase 3 gap-fill
 
     # ═══ PHASE 3: Supplement attacks (cooperative gap-filling) ═════════════════
     if not vlate:

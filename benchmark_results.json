@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-04-18T06:29:43.422802+00:00",
+  "agent_a": "submission.py",
+  "agent_b": "snapshots/agent_v0.py",
+  "mode": "4p",
+  "total_games": 30,
+  "wins_a": 8,
+  "wins_b": 22,
+  "draws": 0,
+  "winrate_a": 0.2932,
+  "winrate_a_ci": [
+    0.1418,
+    0.4445
+  ],
+  "winrate_b": 0.7068,
+  "winrate_b_ci": [
+    0.5555,
+    0.8582
+  ],
+  "avg_ship_lead": -2042.6,
+  "avg_game_length": 327.2,
+  "chi2": 6.5333,
+  "p_value": 0.0106,
+  "significant": 
