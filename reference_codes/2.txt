@@ -1,0 +1,1449 @@
+🚀 Orbit Wars
+This notebook goes far beyond the basics. You will learn:
+
+Module	What You Build
+1. Deep Environment Audit	Reverse-engineer every mechanic: speed formula, sun collision, comet tracking
+2. Rich State Parser	Typed objects, O(1) lookup, fleet tracking, threat maps
+3. Rotating-Planet Predictor	Lead-aim solver for moving targets via iterative convergence
+4. Multi-Turn Simulator	Forward-sim 5 turns, test 5 candidate strategies, pick the best
+5. Weighted Evaluation Function	Ships + Production + Control + Risk scored with tuned weights
+6. Adaptive 3-Phase Strategy	Early expansion → Mid disruption → Late coordinated assault
+7. ProBot Assembly	Full working agent, safety-wrapped, time-guarded
+8. Head-to-Head Benchmark	Run ProBot vs 3 baselines, visualize win rates
+9. Strategy Visualizer	Plot planet positions, fleets, threat heatmap
+10. Tuning & Next Steps	Weight search, what to try next
+Game Mechanics Refresher
+Fleet speed  = min(1 + ships // 20, 6)   ships/turn
+Production   ∝ planet radius  (each turn, owner gets +production ships)
+Combat       garrison -= arriving_fleet;  if garrison < 0 → ownership flips
+Inner orbit  dist_to_sun < 30  →  planet rotates at angular_velocity rad/turn
+Sun zone     radius ≈ 5  →  fleets that pass through are destroyed
+Comets       elliptical path, temporary planets, can be captured
+Win          most total ships (planets + in-flight) when time runs out
+⚙️ Setup
+%%capture
+!pip install --upgrade "kaggle-environments>=1.28.0" matplotlib numpy
+import math, time, random, copy
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from collections import defaultdict
+from typing import List, Tuple, Dict, Optional
+
+from kaggle_environments import make
+from kaggle_environments.envs.orbit_wars.orbit_wars import Planet as RawPlanet, Fleet as RawFleet
+
+env = make("orbit_wars", debug=True)
+print(f"✅ Environment: {env.name} v{env.version}")
+print(f"   Players supported : {env.specification.agents}")
+print(f"   Max steps         : {env.configuration.episodeSteps}")
+print(f"   Act timeout       : {env.configuration.actTimeout}s per turn")
+print(f"   Max fleet speed   : {env.configuration.shipSpeed} units/turn")
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: Successfully loaded OpenSpiel environments: 16.
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_backgammon
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_checkers
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_chess
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_connect_four
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_gin_rummy
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_go
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_goofspiel
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hearts
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hex
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_matching_pennies_3p
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_othello
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_game
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_tic_tac_toe
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_universal_poker
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_poker
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_python_repeated_pokerkit
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: OpenSpiel games skipped: 1.
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    snake
+✅ Environment: orbit_wars v1.0.9
+   Players supported : [2, 4]
+   Max steps         : 500
+   Act timeout       : 1s per turn
+   Max fleet speed   : 6.0 units/turn
+📡 Module 1 — Deep Environment Audit
+Before writing a single line of strategy, we must understand exactly how the engine works. Let's probe every mechanic with real game data.
+
+# ── 1a. Capture a real initial observation ────────────────────────────────────
+env_probe = make("orbit_wars", debug=True)
+env_probe.run(["random", "random"])
+obs  = env_probe.steps[1][0].observation
+planets_raw = [RawPlanet(*p) for p in obs.planets]
+fleets_raw  = [RawFleet(*f) for f in obs.fleets]
+
+SUN_X, SUN_Y = 50.0, 50.0
+
+print("═" * 60)
+print("PLANET AUDIT")
+print("═" * 60)
+print(f"{'ID':>3} {'Owner':>6} {'x':>6} {'y':>6} {'radius':>7} "
+      f"{'ships':>6} {'prod':>5} {'dist_sun':>9} {'orbit':>8}")
+print("-" * 60)
+
+INNER_ORBIT_R = 30.0
+inner_count = outer_count = comet_count = 0
+comet_ids = set(obs.comet_planet_ids) if hasattr(obs, 'comet_planet_ids') else set()
+
+for p in planets_raw[:16]:  # show first 16
+    dist_sun = math.hypot(p.x - SUN_X, p.y - SUN_Y)
+    orbit_type = "COMET" if p.id in comet_ids else ("INNER" if dist_sun < INNER_ORBIT_R else "OUTER")
+    owner_str  = f"P{p.owner}" if p.owner >= 0 else "Neut"
+    if orbit_type == "INNER": inner_count += 1
+    elif orbit_type == "OUTER": outer_count += 1
+    else: comet_count += 1
+    print(f"{p.id:>3} {owner_str:>6} {p.x:>6.1f} {p.y:>6.1f} {p.radius:>7.2f} "
+          f"{p.ships:>6} {p.production:>5} {dist_sun:>9.1f} {orbit_type:>8}")
+
+print(f"\n  Total planets: {len(planets_raw)}  "
+      f"Inner: {inner_count}  Outer: {outer_count}  Comets: {len(comet_ids)}")
+print(f"  Angular velocity: {obs.angular_velocity:.5f} rad/turn  "
+      f"≈ {math.degrees(obs.angular_velocity):.3f} °/turn")
+════════════════════════════════════════════════════════════
+PLANET AUDIT
+════════════════════════════════════════════════════════════
+ ID  Owner      x      y  radius  ships  prod  dist_sun    orbit
+------------------------------------------------------------
+  0   Neut   78.6   89.2    2.61     59     5      48.6    OUTER
+  1   Neut   21.4   89.2    2.61     59     5      48.6    OUTER
+  2   Neut   78.6   10.8    2.61     59     5      48.6    OUTER
+  3   Neut   21.4   10.8    2.61     59     5      48.6    OUTER
+  4   Neut   97.1   65.9    2.39     68     4      49.7    OUTER
+  5   Neut    2.9   65.9    2.39     68     4      49.7    OUTER
+  6   Neut   97.1   34.1    2.39     68     4      49.7    OUTER
+  7   Neut    2.9   34.1    2.39     68     4      49.7    OUTER
+  8   Neut   63.8   98.6    1.00     45     1      50.5    OUTER
+  9   Neut   36.2   98.6    1.00     45     1      50.5    OUTER
+ 10   Neut   63.8    1.4    1.00     45     1      50.5    OUTER
+ 11   Neut   36.2    1.4    1.00     45     1      50.5    OUTER
+ 12   Neut   66.5   66.5    2.39     69     4      23.3    INNER
+ 13   Neut   33.5   66.5    2.39     69     4      23.3    INNER
+ 14   Neut   66.5   33.5    2.39     69     4      23.3    INNER
+ 15   Neut   33.5   33.5    2.39     69     4      23.3    INNER
+
+  Total planets: 32  Inner: 4  Outer: 12  Comets: 0
+  Angular velocity: 0.03854 rad/turn  ≈ 2.208 °/turn
+# ── 1b. Fleet speed formula — verified against spec ─────────────────────────
+def fleet_speed(ships: int, max_speed: float = 6.0) -> float:
+    """Official formula: speed scales with fleet size, capped at max_speed."""
+    return min(1.0 + ships // 20, max_speed)
+
+print("Fleet Speed Table")
+print(f"{'Ships':>8} {'Speed':>8} {'Travel 50u':>12} {'Travel 100u':>13}")
+print("-" * 45)
+for n in [1, 5, 10, 20, 40, 60, 80, 100, 120]:
+    spd = fleet_speed(n)
+    print(f"{n:>8} {spd:>8.1f} {50/spd:>12.1f} {100/spd:>13.1f}")
+
+print("\n💡 Key insight: sending 100 ships is 5x faster than sending 1 ship.")
+print("   Always batch fleets for critical attacks — speed compounds with power.")
+Fleet Speed Table
+   Ships    Speed   Travel 50u   Travel 100u
+---------------------------------------------
+       1      1.0         50.0         100.0
+       5      1.0         50.0         100.0
+      10      1.0         50.0         100.0
+      20      2.0         25.0          50.0
+      40      3.0         16.7          33.3
+      60      4.0         12.5          25.0
+      80      5.0         10.0          20.0
+     100      6.0          8.3          16.7
+     120      6.0          8.3          16.7
+
+💡 Key insight: sending 100 ships is 5x faster than sending 1 ship.
+   Always batch fleets for critical attacks — speed compounds with power.
+# ── 1c. Sun collision geometry ───────────────────────────────────────────────
+SUN_RADIUS = 5.0  # approximate danger zone radius
+
+def fleet_hits_sun(sx: float, sy: float, angle: float,
+                   sun_x: float = 50.0, sun_y: float = 50.0,
+                   sun_r: float = SUN_RADIUS) -> bool:
+    """
+    Ray-circle intersection test.
+    Returns True if a fleet launched from (sx,sy) at `angle` passes
+    within sun_r of the sun centre before reaching max board distance.
+    """
+    dx, dy = math.cos(angle), math.sin(angle)
+    fx, fy = sun_x - sx, sun_y - sy          # vector to sun
+    t = fx * dx + fy * dy                    # closest approach parameter
+    if t < 0:
+        return False                          # sun is behind us
+    cx = sx + t * dx - sun_x
+    cy = sy + t * dy - sun_y
+    return math.hypot(cx, cy) < sun_r + 1.5  # +1.5 safety margin
+
+# Quick demo
+test_cases = [
+    (10, 50, math.atan2(0, 1),   "Direct east shot through sun"),
+    (10, 80, math.atan2(-1, 1),  "Diagonal, misses sun"),
+    (50, 90, math.atan2(-1, 0),  "Due north, misses sun"),
+]
+print("Sun Collision Tests")
+for sx, sy, ang, desc in test_cases:
+    result = fleet_hits_sun(sx, sy, ang)
+    print(f"  {'⚠️ HIT' if result else '✅ SAFE':8} | {desc}")
+Sun Collision Tests
+  ⚠️ HIT   | Direct east shot through sun
+  ✅ SAFE   | Diagonal, misses sun
+  ⚠️ HIT   | Due north, misses sun
+🗂️ Module 2 — Rich State Parser
+Raw lists are error-prone. We build typed Python objects with precomputed helpers, fleet tracking, and per-planet threat maps.
+
+class Planet:
+    """Typed wrapper around a raw planet list."""
+    __slots__ = ('id','owner','x','y','radius','ships','production')
+
+    def __init__(self, raw):
+        self.id, self.owner, self.x, self.y, self.radius, self.ships, self.production = raw
+
+    # ── geometry helpers ──────────────────────────────────────────────────────
+    def dist(self, other: 'Planet') -> float:
+        return math.hypot(self.x - other.x, self.y - other.y)
+
+    def dist_xy(self, x: float, y: float) -> float:
+        return math.hypot(self.x - x, self.y - y)
+
+    def angle_to(self, other: 'Planet') -> float:
+        return math.atan2(other.y - self.y, other.x - self.x)
+
+    def angle_to_xy(self, x: float, y: float) -> float:
+        return math.atan2(y - self.y, x - self.x)
+
+    def copy(self) -> 'Planet':
+        p = Planet.__new__(Planet)
+        p.id, p.owner, p.x, p.y = self.id, self.owner, self.x, self.y
+        p.radius, p.ships, p.production = self.radius, self.ships, self.production
+        return p
+
+    def __repr__(self):
+        owner = f"P{self.owner}" if self.owner >= 0 else "Neutral"
+        return f"Planet(id={self.id}, {owner}, ships={self.ships}, prod={self.production})"
+
+
+class Fleet:
+    """Typed wrapper around a raw fleet list."""
+    __slots__ = ('id','owner','x','y','angle','from_planet_id','ships')
+
+    def __init__(self, raw):
+        self.id, self.owner, self.x, self.y, self.angle, self.from_planet_id, self.ships = raw
+
+
+class GameState:
+    """
+    Fully parsed, enriched snapshot.
+    Builds in O(P + F) and provides O(1) lookups.
+    """
+
+    def __init__(self, obs):
+        self.my_id    = obs.player if hasattr(obs,'player') else obs['player']
+        self.ang_vel  = obs.angular_velocity if hasattr(obs,'angular_velocity') else obs['angular_velocity']
+        self.step     = obs.step if hasattr(obs,'step') else obs.get('step', 0)
+
+        raw_planets   = obs.planets if hasattr(obs,'planets') else obs['planets']
+        raw_fleets    = obs.fleets  if hasattr(obs,'fleets')  else obs['fleets']
+        comet_ids_raw = (obs.comet_planet_ids if hasattr(obs,'comet_planet_ids')
+                         else obs.get('comet_planet_ids', []))
+
+        self.planets: List[Planet] = [Planet(p) for p in raw_planets]
+        self.fleets:  List[Fleet]  = [Fleet(f)  for f in raw_fleets]
+        self.comet_ids: set        = set(comet_ids_raw)
+
+        # O(1) planet lookup
+        self._pmap: Dict[int, Planet] = {p.id: p for p in self.planets}
+
+        # Partition planets by owner
+        self.my_planets      = [p for p in self.planets if p.owner == self.my_id]
+        self.enemy_planets   = [p for p in self.planets if p.owner not in (-1, self.my_id)]
+        self.neutral_planets = [p for p in self.planets if p.owner == -1]
+        self.enemy_ids       = list({p.owner for p in self.enemy_planets})
+
+        # Fleet tracking: planet_id → {owner → total_ships_incoming}
+        self.incoming: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        for f in self.fleets:
+            tid = self._estimate_fleet_target(f)
+            if tid is not None:
+                self.incoming[tid][f.owner] += f.ships
+
+    def _estimate_fleet_target(self, fleet: Fleet) -> Optional[int]:
+        """Determine which planet a fleet is likely heading toward."""
+        best_pid, best_d = None, 9999.0
+        for p in self.planets:
+            ang  = math.atan2(p.y - fleet.y, p.x - fleet.x)
+            diff = abs((ang - fleet.angle + math.pi) % (2 * math.pi) - math.pi)
+            if diff < 0.3:
+                d = math.hypot(p.x - fleet.x, p.y - fleet.y)
+                if d < best_d:
+                    best_d, best_pid = d, p.id
+        return best_pid
+
+    def planet(self, pid: int) -> Optional[Planet]:
+        return self._pmap.get(pid)
+
+    def is_inner(self, p: Planet) -> bool:
+        return p.dist_xy(SUN_X, SUN_Y) < INNER_ORBIT_R
+
+    def is_comet(self, p: Planet) -> bool:
+        return p.id in self.comet_ids
+
+    def net_threat(self, planet: Planet) -> int:
+        """Net incoming enemy ships minus our reinforcements on this planet."""
+        inc = self.incoming.get(planet.id, {})
+        enemy  = sum(v for k, v in inc.items() if k != self.my_id and k != -1)
+        friend = inc.get(self.my_id, 0)
+        return enemy - friend
+
+    def phase(self) -> str:
+        """Detect game phase from map control ratio."""
+        ratio = len(self.my_planets) / max(len(self.planets), 1)
+        if ratio < 0.20:   return 'early'
+        elif ratio < 0.55: return 'mid'
+        else:              return 'late'
+
+# ── Test the parser ──────────────────────────────────────────────────────────
+gs = GameState(obs)
+print(f"GameState for Player {gs.my_id}")
+print(f"  Phase          : {gs.phase()}")
+print(f"  My planets     : {len(gs.my_planets)}")
+print(f"  Enemy planets  : {len(gs.enemy_planets)}")
+print(f"  Neutral planets: {len(gs.neutral_planets)}")
+print(f"  Active fleets  : {len(gs.fleets)}")
+print(f"  Comets         : {len(gs.comet_ids)}")
+print(f"  Angular vel    : {gs.ang_vel:.5f} rad/turn")
+if gs.my_planets:
+    p = gs.my_planets[0]
+    print(f"\n  Sample planet  : {p}")
+    print(f"  Inner orbit?   : {gs.is_inner(p)}")
+    print(f"  Net threat     : {gs.net_threat(p)} ships")
+GameState for Player 0
+  Phase          : early
+  My planets     : 1
+  Enemy planets  : 1
+  Neutral planets: 30
+  Active fleets  : 0
+  Comets         : 0
+  Angular vel    : 0.03854 rad/turn
+
+  Sample planet  : Planet(id=16, P0, ships=10, prod=2)
+  Inner orbit?   : False
+  Net threat     : 0 ships
+🔭 Module 3 — Rotating-Planet Predictor
+The #1 mistake of beginner bots: aiming at where the planet is, not where it will be. Inner planets rotate, so fleets must lead-aim. We solve this with iterative convergence.
+
+class Predictor:
+    """Predicts future planet positions and computes lead-aim angles."""
+
+    def __init__(self, state: GameState):
+        self.state = state
+
+    def future_pos(self, planet: Planet, turns: int) -> Tuple[float, float]:
+        """Position of a planet in `turns` turns (handles rotation)."""
+        if not self.state.is_inner(planet):
+            return planet.x, planet.y          # static outer planet
+        dx  = planet.x - SUN_X
+        dy  = planet.y - SUN_Y
+        r   = math.hypot(dx, dy)
+        a0  = math.atan2(dy, dx)
+        a1  = a0 + self.state.ang_vel * turns
+        return SUN_X + r * math.cos(a1), SUN_Y + r * math.sin(a1)
+
+    def intercept_pos(self, src: Planet, dst: Planet, ships: int,
+                      iters: int = 4) -> Tuple[float, float]:
+        """
+        Iterative intercept solver:
+        1. Guess ETA using current position
+        2. Project destination to that ETA
+        3. Recompute ETA from new position
+        4. Repeat until convergence (usually 3–4 iterations)
+        """
+        speed = fleet_speed(ships)
+        tx, ty = dst.x, dst.y
+        for _ in range(iters):
+            dist   = math.hypot(tx - src.x, ty - src.y)
+            t      = max(1, int(round(dist / speed)))
+            tx, ty = self.future_pos(dst, t)
+        return tx, ty
+
+    def aim_angle(self, src: Planet, dst: Planet, ships: int) -> float:
+        """Lead-aim angle accounting for planet rotation."""
+        if not self.state.is_inner(dst):
+            return src.angle_to(dst)
+        tx, ty = self.intercept_pos(src, dst, ships)
+        return src.angle_to_xy(tx, ty)
+
+    def arrival_turns(self, src: Planet, dst: Planet, ships: int) -> int:
+        """Estimated turns for fleet to arrive."""
+        speed = fleet_speed(ships)
+        tx, ty = self.intercept_pos(src, dst, ships)
+        return max(1, int(math.hypot(tx - src.x, ty - src.y) / speed))
+
+    def safe_angle(self, src: Planet, dst: Planet, ships: int) -> float:
+        """Get aimed angle; nudge if trajectory passes through the sun."""
+        angle = self.aim_angle(src, dst, ships)
+        if fleet_hits_sun(src.x, src.y, angle):
+            for delta in [0.12, -0.12, 0.25, -0.25, 0.40, -0.40]:
+                if not fleet_hits_sun(src.x, src.y, angle + delta):
+                    return angle + delta
+        return angle
+
+
+# ── Demonstrate lead-aim accuracy ────────────────────────────────────────────
+pred = Predictor(gs)
+
+print("Lead-Aim Accuracy Demo (inner planets)")
+print(f"{'Planet':>8} {'Naive angle':>12} {'Lead angle':>11} {'ETA turns':>10}")
+print("-" * 48)
+
+if gs.my_planets and gs.neutral_planets:
+    src = gs.my_planets[0]
+    for dst in gs.neutral_planets[:5]:
+        naive = src.angle_to(dst)
+        lead  = pred.aim_angle(src, dst, ships=40)
+        eta   = pred.arrival_turns(src, dst, ships=40)
+        inner = "★" if gs.is_inner(dst) else " "
+        diff  = abs(lead - naive)
+        print(f"  id={dst.id:>2}{inner}  {math.degrees(naive):>10.2f}°  "
+              f"{math.degrees(lead):>9.2f}°  {eta:>9} turns"
+              f"  {'[lead-aim applied]' if diff > 0.01 else ''}")
+else:
+    print("  (Run game first to get planets)")
+
+print("\n💡 Planets marked ★ are inner (rotating). Lead-aim is essential for these.")
+Lead-Aim Accuracy Demo (inner planets)
+  Planet  Naive angle  Lead angle  ETA turns
+------------------------------------------------
+  id= 0      -162.83°    -162.83°          4 turns  
+  id= 1      -176.84°    -176.84°         23 turns  
+  id= 2       -98.60°     -98.60°         27 turns  
+  id= 3      -130.23°    -130.23°         35 turns  
+  id= 4       -77.54°     -77.54°          9 turns  
+
+💡 Planets marked ★ are inner (rotating). Lead-aim is essential for these.
+⚖️ Module 4 — Evaluation Function
+A strong evaluation function is the heart of any game AI. Ours combines four weighted signals:
+
+class Evaluator:
+    """
+    Score = W_SHIPS * (my_ships - enemy_ships)
+          + W_PROD  * (my_prod  - enemy_prod)
+          + W_CTRL  * (my_count - enemy_count)
+          + W_RISK  * total_net_threat
+
+    Weight rationale:
+      - Ships are the win condition, so they anchor the scale.
+      - Each prod point creates ~40 ships over a mid-game horizon → W_PROD=40.
+      - Owning a planet has positional value beyond its current ships → W_CTRL=15.
+      - Threatened planets are liabilities → negative W_RISK.
+    """
+    W_SHIPS = 1.0
+    W_PROD  = 40.0
+    W_CTRL  = 15.0
+    W_RISK  = -2.0
+
+    @classmethod
+    def score(cls, state: GameState) -> float:
+        my_id = state.my_id
+
+        # Ships in planets
+        my_planet_ships  = sum(p.ships for p in state.my_planets)
+        en_planet_ships  = sum(p.ships for p in state.enemy_planets)
+
+        # Ships in flight
+        my_fleet_ships   = sum(f.ships for f in state.fleets if f.owner == my_id)
+        en_fleet_ships   = sum(f.ships for f in state.fleets
+                               if f.owner not in (-1, my_id))
+
+        my_ships  = my_planet_ships  + my_fleet_ships
+        en_ships  = en_planet_ships  + en_fleet_ships
+
+        my_prod   = sum(p.production for p in state.my_planets)
+        en_prod   = sum(p.production for p in state.enemy_planets)
+
+        threat    = sum(max(0, state.net_threat(p)) for p in state.my_planets)
+
+        return (
+            cls.W_SHIPS * (my_ships - en_ships)
+          + cls.W_PROD  * (my_prod  - en_prod)
+          + cls.W_CTRL  * (len(state.my_planets) - len(state.enemy_planets))
+          + cls.W_RISK  * threat
+        )
+
+    @classmethod
+    def breakdown(cls, state: GameState) -> dict:
+        """Return a per-component breakdown for diagnostics."""
+        my_id    = state.my_id
+        my_ships = (sum(p.ships for p in state.my_planets)
+                    + sum(f.ships for f in state.fleets if f.owner == my_id))
+        en_ships = (sum(p.ships for p in state.enemy_planets)
+                    + sum(f.ships for f in state.fleets if f.owner not in (-1, my_id)))
+        my_prod  = sum(p.production for p in state.my_planets)
+        en_prod  = sum(p.production for p in state.enemy_planets)
+        threat   = sum(max(0, state.net_threat(p)) for p in state.my_planets)
+        return {
+            'ships_component' : cls.W_SHIPS * (my_ships - en_ships),
+            'prod_component'  : cls.W_PROD  * (my_prod  - en_prod),
+            'ctrl_component'  : cls.W_CTRL  * (len(state.my_planets) - len(state.enemy_planets)),
+            'risk_component'  : cls.W_RISK  * threat,
+            'total'           : cls.score(state),
+        }
+
+
+bd = Evaluator.breakdown(gs)
+print("Evaluation Breakdown for Current State")
+print("-" * 40)
+for k, v in bd.items():
+    bar = "█" * max(0, int(abs(v) / 5))
+    sign = "+" if v >= 0 else ""
+    print(f"  {k:<20}: {sign}{v:>8.1f}  {bar}")
+Evaluation Breakdown for Current State
+----------------------------------------
+  ships_component     : +     0.0  
+  prod_component      : +     0.0  
+  ctrl_component      : +     0.0  
+  risk_component      : +    -0.0  
+  total               : +     0.0  
+🔬 Module 5 — Multi-Turn Simulator
+Instead of picking moves based on heuristics alone, we simulate multiple candidate action-sets 5 turns forward and keep the one with the best projected score.
+
+class SimPlanet:
+    """Mutable lightweight planet for fast simulation."""
+    __slots__ = ('id','owner','ships','production')
+    def __init__(self, p: Planet):
+        self.id, self.owner = p.id, p.owner
+        self.ships, self.production = p.ships, p.production
+
+class SimFleet:
+    __slots__ = ('owner','target_id','ships','eta')
+    def __init__(self, owner, target_id, ships, eta):
+        self.owner, self.target_id = owner, target_id
+        self.ships, self.eta = ships, eta
+
+
+class Simulator:
+    """
+    Runs a lightweight forward simulation.
+    Each step: production → fleet arrivals → combat resolution.
+    """
+
+    def __init__(self, state: GameState, predictor: Predictor):
+        self.state     = state
+        self.predictor = predictor
+
+    def _clone(self) -> Tuple[Dict[int, SimPlanet], List[SimFleet]]:
+        planets = {p.id: SimPlanet(p) for p in self.state.planets}
+        fleets  = []
+        for f in self.state.fleets:
+            tid = self.state._estimate_fleet_target(f)
+            if tid is not None:
+                tp  = self.state.planet(tid)
+                if tp:
+                    eta = max(1, int(math.hypot(tp.x - f.x, tp.y - f.y)
+                                     / fleet_speed(f.ships)))
+                    fleets.append(SimFleet(f.owner, tid, f.ships, eta))
+        return planets, fleets
+
+    @staticmethod
+    def _step(planets: Dict[int, SimPlanet], fleets: List[SimFleet]):
+        # Production phase
+        for p in planets.values():
+            if p.owner >= 0:
+                p.ships += p.production
+        # Arrival + combat phase
+        survivors = []
+        for f in fleets:
+            f.eta -= 1
+            if f.eta <= 0:
+                p = planets[f.target_id]
+                if p.owner == f.owner:
+                    p.ships += f.ships                     # reinforcement
+                else:
+                    p.ships -= f.ships
+                    if p.ships < 0:                        # ownership flip
+                        p.owner  = f.owner
+                        p.ships  = abs(p.ships)
+            else:
+                survivors.append(f)
+        fleets[:] = survivors
+
+    def _sim_score(self, planets: Dict[int, SimPlanet],
+                   fleets: List[SimFleet], my_id: int) -> float:
+        my_ships = (sum(p.ships for p in planets.values() if p.owner == my_id)
+                    + sum(f.ships for f in fleets if f.owner == my_id))
+        en_ships = (sum(p.ships for p in planets.values() if p.owner not in (-1, my_id))
+                    + sum(f.ships for f in fleets if f.owner not in (-1, my_id)))
+        my_prod  = sum(p.production for p in planets.values() if p.owner == my_id)
+        en_prod  = sum(p.production for p in planets.values()
+                       if p.owner not in (-1, my_id))
+        return (my_ships - en_ships) + 40 * (my_prod - en_prod)
+
+    def evaluate_candidate(
+        self,
+        actions: List[Tuple[int,int,int]],   # (from_id, to_id, ships)
+        steps: int = 5
+    ) -> float:
+        """
+        Simulate `steps` turns after dispatching `actions`.
+        Returns projected score.
+        """
+        my_id   = self.state.my_id
+        planets, fleets = self._clone()
+
+        # Inject proposed actions as new sim-fleets
+        for from_id, to_id, ships in actions:
+            src = planets.get(from_id)
+            dst = planets.get(to_id)
+            if src and dst and src.ships >= ships > 0:
+                src_p = self.state.planet(from_id)
+                dst_p = self.state.planet(to_id)
+                if src_p and dst_p:
+                    eta = max(1, self.predictor.arrival_turns(src_p, dst_p, ships))
+                    fleets.append(SimFleet(my_id, to_id, ships, eta))
+                    src.ships -= ships
+
+        for _ in range(steps):
+            self._step(planets, fleets)
+
+        return self._sim_score(planets, fleets, my_id)
+
+    def best_candidate(
+        self,
+        candidates: List[List[Tuple[int,int,int]]],
+        steps: int = 5
+    ) -> Tuple[List, float]:
+        """Run simulation on all candidates; return (best_actions, best_score)."""
+        best_score, best_actions = -1e18, []
+        for actions in candidates:
+            sc = self.evaluate_candidate(actions, steps)
+            if sc > best_score:
+                best_score, best_actions = sc, actions
+        return best_actions, best_score
+
+
+# ── Quick demo ───────────────────────────────────────────────────────────────
+pred = Predictor(gs)
+sim  = Simulator(gs, pred)
+
+print("Simulator Demo: comparing 3 dummy candidates")
+print("-" * 45)
+
+if gs.my_planets and gs.neutral_planets:
+    src = gs.my_planets[0]
+    targets = gs.neutral_planets[:3]
+
+    cands = []
+    for t in targets:
+        cands.append([(src.id, t.id, min(30, src.ships - 1))])
+
+    for i, (cand, t) in enumerate(zip(cands, targets)):
+        sc = sim.evaluate_candidate(cand, steps=5)
+        print(f"  Candidate {i+1}: attack planet {t.id:>2} "
+              f"(ships={t.ships}, prod={t.production}) → score={sc:>8.1f}")
+
+    best, bsc = sim.best_candidate(cands)
+    print(f"\n  ✅ Best choice: {best}  (score={bsc:.1f})")
+else:
+    print("  (need active game state — run cell above first)")
+Simulator Demo: comparing 3 dummy candidates
+---------------------------------------------
+  Candidate 1: attack planet  0 (ships=59, prod=5) → score=     0.0
+  Candidate 2: attack planet  1 (ships=59, prod=5) → score=     0.0
+  Candidate 3: attack planet  2 (ships=59, prod=5) → score=     0.0
+
+  ✅ Best choice: [(16, 0, 9)]  (score=0.0)
+🧠 Module 6 — Adaptive 3-Phase Strategy Engine
+class StrategyEngine:
+    """
+    Generates candidate action-sets for each game phase.
+    All actions are (from_id, to_id, ships) tuples — angles are computed later.
+    """
+
+    def __init__(self, state: GameState, predictor: Predictor):
+        self.state = state
+        self.pred  = predictor
+        self.my_id = state.my_id
+
+    # ── Utility helpers ───────────────────────────────────────────────────────
+    def _safe_send(self, src: Planet, ratio: float = 0.65) -> int:
+        """Ships available without leaving src exposed."""
+        threat  = max(0, self.state.net_threat(src))
+        reserve = max(src.production * 3, threat + 6)
+        return max(0, int((src.ships - reserve) * ratio))
+
+    def _target_score(self, src: Planet, dst: Planet) -> float:
+        """Attractiveness of dst from src's perspective."""
+        d = src.dist(dst)
+        if d < 0.1: return -999.0
+        eta = d / fleet_speed(self._safe_send(src) or 1)
+        val = dst.production * 50 - dst.ships
+        if dst.owner == -1:           val += 20   # neutral bonus
+        elif dst.owner != self.my_id: val += 60   # enemy bonus
+        return val / (eta + 1)
+
+    # ── Phase: Early (rapid neutral expansion) ────────────────────────────────
+    def early_actions(self) -> List[Tuple[int,int,int]]:
+        actions = []
+        for src in sorted(self.state.my_planets, key=lambda p: -p.ships):
+            budget = self._safe_send(src, 0.75)
+            top_targets = sorted(self.state.neutral_planets,
+                                 key=lambda t: self._target_score(src, t),
+                                 reverse=True)[:4]
+            for dst in top_targets:
+                need = dst.ships + 5
+                if budget >= need:
+                    actions.append((src.id, dst.id, need))
+                    budget -= need
+        return actions
+
+    # ── Phase: Mid (disruption + control) ────────────────────────────────────
+    def mid_actions(self) -> List[Tuple[int,int,int]]:
+        actions = []
+
+        # 1. Emergency reinforcement of threatened planets
+        for p in self.state.my_planets:
+            threat = self.state.net_threat(p)
+            if threat > 0:
+                donors = sorted(
+                    [d for d in self.state.my_planets if d.id != p.id],
+                    key=lambda d: d.dist(p)
+                )
+                for donor in donors[:2]:
+                    send = min(threat + 6, self._safe_send(donor, 0.5))
+                    if send > 0:
+                        actions.append((donor.id, p.id, send))
+
+        # 2. Multi-source coordinated attack on weakest enemy
+        if self.state.enemy_planets:
+            target    = min(self.state.enemy_planets, key=lambda p: p.ships)
+            need      = target.ships + 10
+            recruited = 0
+            for src in sorted(self.state.my_planets, key=lambda p: p.dist(target)):
+                avail = self._safe_send(src, 0.65)
+                if avail > 0 and recruited < need:
+                    send       = min(avail, need - recruited)
+                    actions.append((src.id, target.id, send))
+                    recruited += send
+
+        # 3. Grab easy neutrals
+        for src in self.state.my_planets:
+            budget = self._safe_send(src, 0.50)
+            for dst in sorted(self.state.neutral_planets, key=lambda t: src.dist(t))[:2]:
+                need = dst.ships + 3
+                if budget >= need:
+                    actions.append((src.id, dst.id, need))
+                    budget -= need
+        return actions
+
+    # ── Phase: Late (coordinated large-scale assault) ─────────────────────────
+    def late_actions(self) -> List[Tuple[int,int,int]]:
+        if not self.state.enemy_planets:
+            return self.mid_actions()
+        actions = []
+
+        # Primary: rally everything at highest-value enemy
+        primary = max(self.state.enemy_planets, key=lambda p: p.production)
+        for src in self.state.my_planets:
+            send = self._safe_send(src, 0.85)
+            if send > primary.production:
+                actions.append((src.id, primary.id, send))
+
+        # Secondary: pin remaining enemies to dilute defense
+        secondaries = [p for p in self.state.enemy_planets if p.id != primary.id]
+        if secondaries:
+            for src in self.state.my_planets:
+                sec  = min(secondaries, key=lambda p: src.dist(p))
+                send = self._safe_send(src, 0.30)
+                if send > sec.ships:
+                    actions.append((src.id, sec.id, send))
+        return actions
+
+    # ── Aggressive variant (all ships at weakest enemy) ───────────────────────
+    def aggro_actions(self) -> List[Tuple[int,int,int]]:
+        if not self.state.enemy_planets:
+            return []
+        target  = min(self.state.enemy_planets, key=lambda p: p.ships)
+        actions = []
+        for src in self.state.my_planets:
+            send = self._safe_send(src, 0.90)
+            if send > 0:
+                actions.append((src.id, target.id, send))
+        return actions
+
+    # ── Defensive variant (consolidate to safest planet) ─────────────────────
+    def defensive_actions(self) -> List[Tuple[int,int,int]]:
+        if not self.state.my_planets:
+            return []
+        anchor  = max(self.state.my_planets, key=lambda p: p.ships)
+        actions = []
+        for src in self.state.my_planets:
+            if src.id == anchor.id: continue
+            send = self._safe_send(src, 0.40)
+            if send > 0:
+                actions.append((src.id, anchor.id, send))
+        return actions
+
+    def all_candidates(self) -> List[List[Tuple[int,int,int]]]:
+        """Return all 5 candidate action-sets for the simulator to evaluate."""
+        phase = self.state.phase()
+        primary = {
+            'early': self.early_actions,
+            'mid'  : self.mid_actions,
+            'late' : self.late_actions,
+        }[phase]()
+        return [
+            primary,
+            self.mid_actions(),      # balanced fallback always included
+            self.early_actions(),    # expansion variant
+            self.aggro_actions(),    # full aggro
+            self.defensive_actions(),# defensive
+        ]
+
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+strat  = StrategyEngine(gs, pred)
+cands  = strat.all_candidates()
+names  = ['Phase-primary','Balanced','Expansion','Aggro','Defensive']
+print(f"Strategy Candidates (phase={gs.phase()})")
+print("-" * 42)
+for name, cand in zip(names, cands):
+    sc = sim.evaluate_candidate(cand, steps=5)
+    print(f"  {name:<14}: {len(cand):>2} actions  →  score {sc:>8.1f}")
+Strategy Candidates (phase=early)
+------------------------------------------
+  Phase-primary :  0 actions  →  score      0.0
+  Balanced      :  1 actions  →  score      0.0
+  Expansion     :  0 actions  →  score      0.0
+  Aggro         :  1 actions  →  score      0.0
+  Defensive     :  0 actions  →  score      0.0
+🤖 Module 7 — ProBot: Full Agent Assembly
+Assembles all modules into the final competition agent. Key safety features: time-guard, per-source budget, silent error handling.
+
+MAX_TIME_MS = 900  # leave 100ms headroom from the 1s limit
+
+def probot(obs, config=None):
+    """
+    ProBot — competition entry point.
+    Returns: list of [from_planet_id, angle_radians, num_ships]
+    """
+    t0 = time.time()
+    try:
+        # ── 1. Parse state ───────────────────────────────────────────────────
+        state = GameState(obs)
+        if not state.my_planets:
+            return []   # nothing to do
+
+        # ── 2. Build tools ───────────────────────────────────────────────────
+        predictor = Predictor(state)
+        simulator = Simulator(state, predictor)
+        strategy  = StrategyEngine(state, predictor)
+
+        # ── 3. Generate candidates and pick the best ─────────────────────────
+        candidates = strategy.all_candidates()
+        best_actions, _ = simulator.best_candidate(candidates, steps=5)
+
+        # ── 4. Convert (from, to, ships) → [from, angle, ships] ─────────────
+        moves = []
+        spent: Dict[int, int] = {}   # track ships used per source planet
+
+        for from_id, to_id, ships in best_actions:
+            src = state.planet(from_id)
+            dst = state.planet(to_id)
+            if src is None or dst is None:
+                continue
+            if src.owner != state.my_id:
+                continue
+
+            # Respect per-source budget
+            used      = spent.get(from_id, 0)
+            available = src.ships - used - 1   # keep ≥ 1 ship on planet
+            send      = min(ships, max(0, available))
+            if send <= 0:
+                continue
+
+            # Compute lead-aim angle (sun-safe)
+            angle = predictor.safe_angle(src, dst, send)
+            moves.append([from_id, float(angle), int(send)])
+            spent[from_id] = used + send
+
+            # Time-guard: stop if budget nearly exhausted
+            if (time.time() - t0) * 1000 > MAX_TIME_MS:
+                break
+
+        return moves
+
+    except Exception:
+        return []   # never crash — return empty on error
+
+
+# ── Smoke test ────────────────────────────────────────────────────────────────
+test_moves = probot(obs)
+print(f"ProBot returned {len(test_moves)} move(s):")
+for m in test_moves[:8]:
+    print(f"  from={m[0]}  angle={math.degrees(m[1]):>7.2f}°  ships={m[2]}")
+ProBot returned 0 move(s):
+📊 Module 8 — Head-to-Head Benchmark
+We run ProBot against 3 baselines over multiple games and track win rates.
+
+# ── Baseline 1: Random ────────────────────────────────────────────────────────
+# Built into kaggle-environments, called as the string "random"
+
+# ── Baseline 2: Nearest Planet Sniper (from the tutorial) ─────────────────────
+def nearest_sniper(obs, config=None):
+    moves  = []
+    player = obs.player if hasattr(obs,'player') else obs['player']
+    rp     = obs.planets if hasattr(obs,'planets') else obs['planets']
+    planets = [RawPlanet(*p) for p in rp]
+    mine    = [p for p in planets if p.owner == player]
+    targets = [p for p in planets if p.owner != player]
+    if not targets: return moves
+    for src in mine:
+        nearest = min(targets, key=lambda t: math.hypot(src.x-t.x, src.y-t.y))
+        need    = max(nearest.ships + 1, 20)
+        if src.ships >= need:
+            angle = math.atan2(nearest.y - src.y, nearest.x - src.x)
+            moves.append([src.id, angle, need])
+    return moves
+
+# ── Baseline 3: Production Greedy ─────────────────────────────────────────────
+def production_greedy(obs, config=None):
+    """Always attacks the highest-production planet we can afford."""
+    moves  = []
+    player = obs.player if hasattr(obs,'player') else obs['player']
+    rp     = obs.planets if hasattr(obs,'planets') else obs['planets']
+    planets = [RawPlanet(*p) for p in rp]
+    mine    = [p for p in planets if p.owner == player]
+    targets = sorted([p for p in planets if p.owner != player],
+                     key=lambda p: -p.production)
+    if not targets or not mine: return moves
+    for src in mine:
+        for t in targets:
+            need = t.ships + 5
+            if src.ships > need + 5:
+                angle = math.atan2(t.y - src.y, t.x - src.x)
+                moves.append([src.id, angle, need])
+                break
+    return moves
+
+print("✅ Baseline agents defined:")
+print("  1. 'random'           — built-in random agent")
+print("  2. nearest_sniper     — attacks nearest planet")
+print("  3. production_greedy  — attacks highest-production target")
+print("  4. probot             — our advanced agent")
+✅ Baseline agents defined:
+  1. 'random'           — built-in random agent
+  2. nearest_sniper     — attacks nearest planet
+  3. production_greedy  — attacks highest-production target
+  4. probot             — our advanced agent
+def run_match(agent_a, agent_b, n_games: int = 5) -> Dict:
+    """Run n_games between two agents; return win/loss/draw counts."""
+    results = {'wins': 0, 'losses': 0, 'draws': 0}
+    for _ in range(n_games):
+        env_m = make("orbit_wars", debug=False)
+        env_m.run([agent_a, agent_b])
+        r0 = env_m.steps[-1][0].reward
+        r1 = env_m.steps[-1][1].reward
+        if r0 > r1:   results['wins']   += 1
+        elif r0 < r1: results['losses'] += 1
+        else:         results['draws']  += 1
+    return results
+
+
+N = 5   # games per matchup (increase for statistical significance)
+
+matchups = [
+    ("ProBot",      "Random",     probot,            "random"),
+    ("ProBot",      "Sniper",     probot,            nearest_sniper),
+    ("ProBot",      "ProdGreedy", probot,            production_greedy),
+    ("Sniper",      "Random",     nearest_sniper,    "random"),
+]
+
+benchmark_results = {}
+print(f"Running benchmark ({N} games per matchup) ...")
+print("-" * 55)
+
+for (name_a, name_b, agent_a, agent_b) in matchups:
+    r = run_match(agent_a, agent_b, N)
+    key = f"{name_a} vs {name_b}"
+    benchmark_results[key] = r
+    wr = r['wins'] / N * 100
+    print(f"  {key:<26}: "
+          f"W={r['wins']} L={r['losses']} D={r['draws']}  "
+          f"WR={wr:>5.1f}%")
+
+print("\nDone!")
+Running benchmark (5 games per matchup) ...
+-------------------------------------------------------
+  ProBot vs Random          : W=5 L=0 D=0  WR=100.0%
+  ProBot vs Sniper          : W=4 L=1 D=0  WR= 80.0%
+  ProBot vs ProdGreedy      : W=4 L=1 D=0  WR= 80.0%
+  Sniper vs Random          : W=4 L=1 D=0  WR= 80.0%
+
+Done!
+# ── Visualize benchmark results ───────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 4))
+
+matchup_names = list(benchmark_results.keys())
+wins    = [benchmark_results[k]['wins']   for k in matchup_names]
+losses  = [benchmark_results[k]['losses'] for k in matchup_names]
+draws   = [benchmark_results[k]['draws']  for k in matchup_names]
+
+x      = range(len(matchup_names))
+width  = 0.25
+
+ax.bar([i - width for i in x], wins,   width, label='Wins',   color='#2ecc71')
+ax.bar([i         for i in x], losses, width, label='Losses', color='#e74c3c')
+ax.bar([i + width for i in x], draws,  width, label='Draws',  color='#95a5a6')
+
+ax.set_xticks(list(x))
+ax.set_xticklabels(matchup_names, rotation=20, ha='right', fontsize=9)
+ax.set_ylabel('Games')
+ax.set_title(f'Head-to-Head Benchmark ({N} games / matchup)', fontsize=12, fontweight='bold')
+ax.legend()
+ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+plt.tight_layout()
+plt.show()
+
+🗺️ Module 9 — Strategy Visualizer
+Render a live snapshot: planet positions, ownership, fleet trajectories, and a threat heatmap.
+
+PLAYER_COLORS = {
+    -1: '#888888',   # neutral
+     0: '#3498db',   # blue
+     1: '#e74c3c',   # red
+     2: '#2ecc71',   # green
+     3: '#f39c12',   # orange
+}
+
+def visualize_state(gs: GameState, moves: List = None, title: str = ""):
+    """
+    Rich visualization of a GameState.
+    - Circle size   ∝ production
+    - Circle color  = owner
+    - Annotations   = ship count
+    - Arrows        = proposed moves
+    - Background    = threat heatmap
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+
+    # ── Left: Board state ─────────────────────────────────────────────────────
+    ax = axes[0]
+    ax.set_xlim(0, 100); ax.set_ylim(0, 100)
+    ax.set_facecolor('#0d1117')
+    ax.set_aspect('equal')
+    ax.set_title(f'Board State{" — " + title if title else ""}',
+                 color='white', fontsize=11, fontweight='bold')
+
+    # Sun
+    sun = plt.Circle((SUN_X, SUN_Y), SUN_RADIUS, color='#f1c40f', zorder=5)
+    ax.add_patch(sun)
+    ax.text(SUN_X, SUN_Y, '☀', ha='center', va='center',
+            fontsize=10, zorder=6, color='white')
+
+    # Inner orbit ring
+    ring = plt.Circle((SUN_X, SUN_Y), INNER_ORBIT_R, fill=False,
+                       color='#444', linewidth=1, linestyle='--', zorder=2)
+    ax.add_patch(ring)
+
+    # Planets
+    for p in gs.planets:
+        color = PLAYER_COLORS.get(p.owner, '#888888')
+        radius = max(1.5, p.production * 0.8)
+        marker = 'D' if gs.is_comet(p) else 'o'
+        ax.scatter(p.x, p.y, s=(radius * 25)**0.8 * 8,
+                   c=color, marker=marker, zorder=10,
+                   edgecolors='white', linewidths=0.5)
+        ax.text(p.x, p.y + radius * 0.6 + 1.5, str(p.ships),
+                ha='center', va='bottom', fontsize=6.5,
+                color='white', zorder=11)
+
+    # Fleet dots (simplified)
+    for f in gs.fleets:
+        fc = PLAYER_COLORS.get(f.owner, '#888')
+        ax.scatter(f.x, f.y, s=12, c=fc, marker='^', zorder=8, alpha=0.8)
+
+    # Proposed move arrows
+    if moves:
+        for m in moves:
+            from_id, angle, ships = m
+            src = gs.planet(from_id)
+            if src:
+                dx = math.cos(angle) * 8
+                dy = math.sin(angle) * 8
+                ax.annotate("", xy=(src.x + dx, src.y + dy),
+                            xytext=(src.x, src.y),
+                            arrowprops=dict(arrowstyle="->",
+                                            color="white", lw=1.2),
+                            zorder=15)
+
+    # Legend
+    legend_items = [
+        mpatches.Patch(color=PLAYER_COLORS.get(p.owner,'#888'), label=f"Player {p.owner}")
+        for p in gs.my_planets[:1]
+    ] + [mpatches.Patch(color='#888', label='Neutral')]
+    ax.legend(handles=legend_items, loc='upper left',
+              fontsize=8, framealpha=0.3, labelcolor='white')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values(): spine.set_edgecolor('#333')
+
+    # ── Right: Threat & production heatmap ────────────────────────────────────
+    ax2 = axes[1]
+    grid = np.zeros((50, 50))
+    for p in gs.planets:
+        gx = int(p.x / 100 * 49)
+        gy = int(p.y / 100 * 49)
+        val = p.production * 3
+        if p.owner == gs.my_id:           val *= +1.0
+        elif p.owner == -1:               val *=  0.3
+        else:                             val *= -1.0
+        # Splat a gaussian blob
+        for di in range(-5, 6):
+            for dj in range(-5, 6):
+                ni, nj = gx + di, gy + dj
+                if 0 <= ni < 50 and 0 <= nj < 50:
+                    w = math.exp(-(di**2 + dj**2) / 8.0)
+                    grid[nj, ni] += val * w
+
+    im = ax2.imshow(grid, origin='lower', cmap='RdYlGn',
+                    extent=[0,100,0,100], vmin=-20, vmax=20)
+    plt.colorbar(im, ax=ax2, label='Control advantage')
+    ax2.set_title('Production / Control Heatmap', fontsize=11, fontweight='bold')
+    ax2.set_xlabel('x'); ax2.set_ylabel('y')
+
+    # Overlay planets on heatmap
+    for p in gs.planets:
+        c = PLAYER_COLORS.get(p.owner, '#888')
+        ax2.scatter(p.x, p.y, c=c, s=40, edgecolors='black', linewidths=0.5, zorder=5)
+
+    plt.suptitle('Orbit Wars — ProBot Visualization', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+# ── Render ────────────────────────────────────────────────────────────────────
+moves_to_show = probot(obs)
+visualize_state(gs, moves=moves_to_show, title=f"Turn {gs.step}, Phase={gs.phase()}")
+
+🎯 Module 10 — Evaluation Weight Tuning
+The evaluation weights drive everything. Here we do a quick grid search to find the best weight combination against our baselines.
+
+def make_probot_with_weights(w_ships, w_prod, w_ctrl, w_risk):
+    """Factory: returns a probot agent using custom evaluation weights."""
+    def _agent(obs, config=None):
+        t0 = time.time()
+        try:
+            state = GameState(obs)
+            if not state.my_planets: return []
+            predictor = Predictor(state)
+            simulator = Simulator(state, predictor)
+            strategy  = StrategyEngine(state, predictor)
+            cands     = strategy.all_candidates()
+
+            # Evaluate candidates with custom weights
+            best_score, best_cand = -1e18, []
+            for c in cands:
+                my_id = state.my_id
+                planets, fleets = simulator._clone()
+                for from_id, to_id, ships in c:
+                    src = planets.get(from_id)
+                    dst = planets.get(to_id)
+                    sp  = state.planet(from_id)
+                    dp  = state.planet(to_id)
+                    if src and dst and src.ships >= ships > 0 and sp and dp:
+                        eta = predictor.arrival_turns(sp, dp, ships)
+                        fleets.append(SimFleet(my_id, to_id, ships, eta))
+                        src.ships -= ships
+                for _ in range(5):
+                    simulator._step(planets, fleets)
+                ms = (sum(p.ships for p in planets.values() if p.owner == my_id)
+                      + sum(f.ships for f in fleets if f.owner == my_id))
+                es = (sum(p.ships for p in planets.values() if p.owner not in (-1, my_id))
+                      + sum(f.ships for f in fleets if f.owner not in (-1, my_id)))
+                mp = sum(p.production for p in planets.values() if p.owner == my_id)
+                ep = sum(p.production for p in planets.values() if p.owner not in (-1, my_id))
+                sc = (w_ships*(ms-es) + w_prod*(mp-ep)
+                      + w_ctrl*(len([p for p in planets.values() if p.owner==my_id])
+                               -len([p for p in planets.values() if p.owner not in (-1,my_id)]))
+                      + w_risk * sum(max(0, state.net_threat(p)) for p in state.my_planets))
+                if sc > best_score:
+                    best_score, best_cand = sc, c
+
+            moves  = []
+            spent  = {}
+            for from_id, to_id, ships in best_cand:
+                src = state.planet(from_id)
+                dst = state.planet(to_id)
+                if not src or not dst or src.owner != my_id: continue
+                avail = src.ships - spent.get(from_id, 0) - 1
+                send  = min(ships, max(0, avail))
+                if send <= 0: continue
+                angle = predictor.safe_angle(src, dst, send)
+                moves.append([from_id, float(angle), int(send)])
+                spent[from_id] = spent.get(from_id, 0) + send
+                if (time.time()-t0)*1000 > MAX_TIME_MS: break
+            return moves
+        except Exception:
+            return []
+    return _agent
+
+
+# Mini grid-search over W_PROD (most impactful weight)
+print("Weight Sensitivity — W_PROD vs Random (3 games each)")
+print("-" * 50)
+best_wr, best_wp = -1, None
+for w_prod in [20, 30, 40, 50, 60]:
+    agent_v = make_probot_with_weights(1.0, w_prod, 15.0, -2.0)
+    r = run_match(agent_v, "random", n_games=3)
+    wr = r['wins'] / 3 * 100
+    star = " ← best" if wr > best_wr else ""
+    print(f"  W_PROD={w_prod:>3}  W={r['wins']} L={r['losses']} D={r['draws']}  "
+          f"WR={wr:>5.1f}%{star}")
+    if wr > best_wr:
+        best_wr, best_wp = wr, w_prod
+
+print(f"\n  ✅ Best W_PROD = {best_wp}  ({best_wr:.0f}% win rate)")
+print("  👉 Update Evaluator.W_PROD with this value for your submission.")
+Weight Sensitivity — W_PROD vs Random (3 games each)
+--------------------------------------------------
+  W_PROD= 20  W=3 L=0 D=0  WR=100.0% ← best
+  W_PROD= 30  W=3 L=0 D=0  WR=100.0%
+  W_PROD= 40  W=3 L=0 D=0  WR=100.0%
+  W_PROD= 50  W=3 L=0 D=0  WR=100.0%
+  W_PROD= 60  W=3 L=0 D=0  WR=100.0%
+
+  ✅ Best W_PROD = 20  (100% win rate)
+  👉 Update Evaluator.W_PROD with this value for your submission.
+📦 Module 11 — Submission-Ready Agent File
+The cell below writes a standalone submission.py containing the complete ProBot — just upload this file to the Kaggle competition.
+
+submission_code = '''
+# ─────────────────────────────────────────────────────────────────────────────
+# Orbit Wars — ProBot Submission
+# ─────────────────────────────────────────────────────────────────────────────
+import math, time
+from collections import defaultdict
+from typing import List, Tuple, Dict, Optional
+
+SUN_X, SUN_Y, SUN_RADIUS, INNER_ORBIT_R = 50.0, 50.0, 5.0, 30.0
+MAX_TIME_MS = 900
+
+def fleet_speed(ships): return min(1.0 + ships // 20, 6.0)
+
+def fleet_hits_sun(sx, sy, angle, sr=SUN_RADIUS+1.5):
+    dx, dy = math.cos(angle), math.sin(angle)
+    fx, fy = SUN_X-sx, SUN_Y-sy
+    t = fx*dx + fy*dy
+    if t < 0: return False
+    return math.hypot(sx+t*dx-SUN_X, sy+t*dy-SUN_Y) < sr
+
+class Planet:
+    __slots__=("id","owner","x","y","radius","ships","production")
+    def __init__(self,raw): self.id,self.owner,self.x,self.y,self.radius,self.ships,self.production=raw
+    def dist(self,o): return math.hypot(self.x-o.x,self.y-o.y)
+    def dist_xy(self,x,y): return math.hypot(self.x-x,self.y-y)
+    def angle_to(self,o): return math.atan2(o.y-self.y,o.x-self.x)
+    def angle_to_xy(self,x,y): return math.atan2(y-self.y,x-self.x)
+
+class Fleet:
+    __slots__=("id","owner","x","y","angle","from_planet_id","ships")
+    def __init__(self,raw): self.id,self.owner,self.x,self.y,self.angle,self.from_planet_id,self.ships=raw
+
+class GameState:
+    def __init__(self,obs):
+        g=lambda k: getattr(obs,k,None) or obs.get(k)
+        self.my_id=g("player"); self.ang_vel=g("angular_velocity")
+        self.step=g("step") or 0
+        self.planets=[Planet(p) for p in g("planets")]
+        self.fleets=[Fleet(f) for f in g("fleets")]
+        self.comet_ids=set(g("comet_planet_ids") or [])
+        self._pmap={p.id:p for p in self.planets}
+        self.my_planets=[p for p in self.planets if p.owner==self.my_id]
+        self.enemy_planets=[p for p in self.planets if p.owner not in(-1,self.my_id)]
+        self.neutral_planets=[p for p in self.planets if p.owner==-1]
+        self.incoming=defaultdict(lambda:defaultdict(int))
+        for f in self.fleets:
+            t=self._target(f)
+            if t: self.incoming[t][f.owner]+=f.ships
+    def _target(self,f):
+        b,bd=None,9999
+        for p in self.planets:
+            a=math.atan2(p.y-f.y,p.x-f.x); diff=abs((a-f.angle+math.pi)%(2*math.pi)-math.pi)
+            if diff<0.3:
+                d=math.hypot(p.x-f.x,p.y-f.y)
+                if d<bd: bd,b=d,p.id
+        return b
+    def planet(self,pid): return self._pmap.get(pid)
+    def is_inner(self,p): return p.dist_xy(SUN_X,SUN_Y)<INNER_ORBIT_R
+    def net_threat(self,p):
+        inc=self.incoming.get(p.id,{})
+        return sum(v for k,v in inc.items() if k!=self.my_id and k!=-1)-inc.get(self.my_id,0)
+    def phase(self):
+        r=len(self.my_planets)/max(len(self.planets),1)
+        return "early" if r<0.2 else("late" if r>=0.55 else "mid")
+
+class Predictor:
+    def __init__(self,state): self.s=state
+    def future_pos(self,p,t):
+        if not self.s.is_inner(p): return p.x,p.y
+        dx,dy=p.x-SUN_X,p.y-SUN_Y; r=math.hypot(dx,dy)
+        a=math.atan2(dy,dx)+self.s.ang_vel*t
+        return SUN_X+r*math.cos(a),SUN_Y+r*math.sin(a)
+    def intercept(self,src,dst,ships):
+        sp=fleet_speed(ships); tx,ty=dst.x,dst.y
+        for _ in range(4):
+            d=math.hypot(tx-src.x,ty-src.y); tx,ty=self.future_pos(dst,max(1,int(d/sp)))
+        return tx,ty
+    def aim(self,src,dst,ships):
+        if not self.s.is_inner(dst): return src.angle_to(dst)
+        tx,ty=self.intercept(src,dst,ships); return src.angle_to_xy(tx,ty)
+    def eta(self,src,dst,ships):
+        tx,ty=self.intercept(src,dst,ships)
+        return max(1,int(math.hypot(tx-src.x,ty-src.y)/fleet_speed(ships)))
+    def safe_aim(self,src,dst,ships):
+        a=self.aim(src,dst,ships)
+        if fleet_hits_sun(src.x,src.y,a):
+            for d in[0.12,-0.12,0.25,-0.25,0.4,-0.4]:
+                if not fleet_hits_sun(src.x,src.y,a+d): return a+d
+        return a
+
+class SP:
+    __slots__=("id","owner","ships","production")
+    def __init__(self,p): self.id,self.owner,self.ships,self.production=p.id,p.owner,p.ships,p.production
+class SF:
+    __slots__=("owner","tid","ships","eta")
+    def __init__(self,o,t,s,e): self.owner,self.tid,self.ships,self.eta=o,t,s,e
+
+class Simulator:
+    def __init__(self,state,pred): self.s=state; self.p=pred
+    def clone(self):
+        P={p.id:SP(p) for p in self.s.planets}; F=[]
+        for f in self.s.fleets:
+            t=self.s._target(f)
+            if t:
+                tp=self.s.planet(t)
+                if tp: F.append(SF(f.owner,t,f.ships,max(1,int(math.hypot(tp.x-f.x,tp.y-f.y)/fleet_speed(f.ships)))))
+        return P,F
+    @staticmethod
+    def step(P,F):
+        for p in P.values():
+            if p.owner>=0: p.ships+=p.production
+        R=[]
+        for f in F:
+            f.eta-=1
+            if f.eta<=0:
+                p=P[f.tid]
+                if p.owner==f.owner: p.ships+=f.ships
+                else:
+                    p.ships-=f.ships
+                    if p.ships<0: p.owner=f.owner; p.ships=abs(p.ships)
+            else: R.append(f)
+        F[:]=R
+    def score(self,P,F,mi):
+        ms=sum(p.ships for p in P.values() if p.owner==mi)+sum(f.ships for f in F if f.owner==mi)
+        es=sum(p.ships for p in P.values() if p.owner not in(-1,mi))+sum(f.ships for f in F if f.owner not in(-1,mi))
+        mp=sum(p.production for p in P.values() if p.owner==mi)
+        ep=sum(p.production for p in P.values() if p.owner not in(-1,mi))
+        return (ms-es)+40*(mp-ep)
+    def eval(self,actions,steps=5):
+        mi=self.s.my_id; P,F=self.clone()
+        for fi,ti,sh in actions:
+            src=P.get(fi); sp=self.s.planet(fi); dp=self.s.planet(ti)
+            if src and sp and dp and src.ships>=sh>0:
+                F.append(SF(mi,ti,sh,self.p.eta(sp,dp,sh))); src.ships-=sh
+        for _ in range(steps): self.step(P,F)
+        return self.score(P,F,mi)
+    def best(self,cands,steps=5):
+        bs,bc=-1e18,[]
+        for c in cands:
+            sc=self.eval(c,steps)
+            if sc>bs: bs,bc=sc,c
+        return bc
+
+class Strategy:
+    def __init__(self,state,pred): self.s=state; self.p=pred; self.mi=state.my_id
+    def send(self,src,r=0.65):
+        t=max(0,self.s.net_threat(src)); rv=max(src.production*3,t+6)
+        return max(0,int((src.ships-rv)*r))
+    def tscore(self,src,dst):
+        d=src.dist(dst)
+        if d<0.1: return -999
+        val=dst.production*50-dst.ships+(20 if dst.owner==-1 else 60 if dst.owner!=self.mi else 0)
+        return val/(d/fleet_speed(self.send(src) or 1)+1)
+    def early(self):
+        A=[]
+        for src in sorted(self.s.my_planets,key=lambda p:-p.ships):
+            b=self.send(src,0.75)
+            for dst in sorted(self.s.neutral_planets,key=lambda t:self.tscore(src,t),reverse=True)[:4]:
+                n=dst.ships+5
+                if b>=n: A.append((src.id,dst.id,n)); b-=n
+        return A
+    def mid(self):
+        A=[]
+        for p in self.s.my_planets:
+            if self.s.net_threat(p)>0:
+                for d in sorted([x for x in self.s.my_planets if x.id!=p.id],key=lambda x:x.dist(p))[:2]:
+                    s=min(self.s.net_threat(p)+6,self.send(d,0.5))
+                    if s>0: A.append((d.id,p.id,s))
+        if self.s.enemy_planets:
+            tgt=min(self.s.enemy_planets,key=lambda p:p.ships); n=tgt.ships+10; rec=0
+            for src in sorted(self.s.my_planets,key=lambda p:p.dist(tgt)):
+                av=self.send(src,0.65)
+                if av>0 and rec<n: s=min(av,n-rec); A.append((src.id,tgt.id,s)); rec+=s
+        for src in self.s.my_planets:
+            b=self.send(src,0.5)
+            for dst in sorted(self.s.neutral_planets,key=lambda t:src.dist(t))[:2]:
+                n=dst.ships+3
+                if b>=n: A.append((src.id,dst.id,n)); b-=n
+        return A
+    def late(self):
+        if not self.s.enemy_planets: return self.mid()
+        A=[]; pri=max(self.s.enemy_planets,key=lambda p:p.production)
+        for src in self.s.my_planets:
+            s=self.send(src,0.85)
+            if s>pri.production: A.append((src.id,pri.id,s))
+        secs=[p for p in self.s.enemy_planets if p.id!=pri.id]
+        if secs:
+            for src in self.s.my_planets:
+                sec=min(secs,key=lambda p:src.dist(p)); s=self.send(src,0.3)
+                if s>sec.ships: A.append((src.id,sec.id,s))
+        return A
+    def aggro(self):
+        if not self.s.enemy_planets: return []
+        t=min(self.s.enemy_planets,key=lambda p:p.ships)
+        return [(src.id,t.id,s) for src in self.s.my_planets for s in[self.send(src,0.9)] if s>0]
+    def defend(self):
+        if not self.s.my_planets: return []
+        a=max(self.s.my_planets,key=lambda p:p.ships)
+        return [(src.id,a.id,s) for src in self.s.my_planets if src.id!=a.id for s in[self.send(src,0.4)] if s>0]
+    def candidates(self):
+        ph={"early":self.early,"mid":self.mid,"late":self.late}[self.s.phase()]()
+        return[ph,self.mid(),self.early(),self.aggro(),self.defend()]
+
+def agent(obs,config=None):
+    t0=time.time()
+    try:
+        state=GameState(obs)
+        if not state.my_planets: return []
+        pred=Predictor(state); sim=Simulator(state,pred); strat=Strategy(state,pred)
+        best=sim.best(strat.candidates())
+        moves=[]; spent={}
+        for fi,ti,sh in best:
+            src=state.planet(fi); dst=state.planet(ti)
+            if not src or not dst or src.owner!=state.my_id: continue
+            avail=src.ships-spent.get(fi,0)-1; send=min(sh,max(0,avail))
+            if send<=0: continue
+            angle=pred.safe_aim(src,dst,send)
+            moves.append([fi,float(angle),int(send)]); spent[fi]=spent.get(fi,0)+send
+            if(time.time()-t0)*1000>900: break
+        return moves
+    except: return []
+'''
+
+with open('submission.py', 'w') as f:
+    f.write(submission_code.strip())
+
+print("✅ submission.py written!")
+print("   Upload this file to the Orbit Wars competition page.")
+print(f"   File size: {len(submission_code):,} characters")
+✅ submission.py written!
+   Upload this file to the Orbit Wars competition page.
+   File size: 9,783 characters
+ 

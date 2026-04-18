@@ -1,0 +1,527 @@
+Orbit Wars: Agent Architecture
+This agent is built to excel in a 4-player Free-For-All environment. It discards standard 1v1 heuristics in favor of tempo, opportunism, and ruthless economic mapping.
+
+1. The 100-Step Forward Oracle¶
+Instead of relying on slow 500-step raycasters or inaccurate static projections, the agent uses a custom get_fleet_arrivals function. It projects every fleet's linear trajectory alongside every planet's orbital trajectory for 120 steps.
+
+Result: Mathematically flawless fleet detection that executes in milliseconds, eliminating timeouts while ensuring accurate combat simulations.
+2. The Value/Cost Decision Matrix
+The bot no longer relies on complex, fragile "synchronized swarm" loops. It generates a master matrix of every possible attack combination on the board.
+
+Value: Evaluated by multiplying the target's production by the turns remaining in the game after the fleet arrives (
+V
+a
+l
+u
+e
+=
+P
+r
+o
+d
+u
+c
+t
+i
+o
+n
+×
+T
+u
+r
+n
+s
+_
+P
+r
+o
+f
+i
+t
+).
+Cost: The exact number of ships needed to overwhelm the simulated defender garrison, plus a distance penalty.
+Execution: The matrix is sorted by the ROI ratio (
+S
+c
+o
+r
+e
+=
+V
+a
+l
+u
+e
+C
+o
+s
+t
++
+1
+). The bot simply fires at targets from the top down, resulting in organic, decentralized swarming.
+3. Free-For-All Macro Awareness
+The agent continuously measures its strength against the single strongest opponent, rather than the lobby combined.
+
+Contested Neutral Avoidance: In the early game, if a neutral planet is physically closer to an enemy cluster than to the agent's base, its ROI score is slashed by 75%. The agent allows enemies to bleed their fleets fighting over contested borders, swooping in later to vulture the survivors.
+Finishing Move: Once the agent achieves a 30% ship lead and an 80% production lead over the #2 player, it drops its defensive margins and initiates a map-sweep to close the game.
+4. Advanced Logistics
+Desperado Strikes: If the combat simulator determines a friendly planet will inevitably fall, the bot does not passively retreat the survivors. It instantly scans the map for a vulnerable enemy planet and launches a suicide strike, forcing the opponent to expend resources dealing with the fallout.
+Rich-Front Funneling: Rear-echelon planets do not blindly forward ships to the nearest friendly base. They actively score all friendly frontlines based on their proximity to high-value enemy targets, channeling the entire economy directly into the throat of the richest opponent.
+!pip install -qU kaggle_environments
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13.3/13.3 MB 88.6 MB/s eta 0:00:00
+The Agent Function
+%%writefile submission.py
+import math
+from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+
+# CONFIG & CONSTANTS
+CENTER_X, CENTER_Y = 50.0, 50.0
+SUN_RADIUS = 10.0
+TOTAL_STEPS = 500
+
+
+# PHYSICS & GEOMETRY
+def calculate_fleet_speed(ships):
+    ships = max(1, min(ships, 1000))
+    ratio = math.log(ships) / math.log(1000.0)
+    return 1.0 + 5.0 * (ratio**1.5)
+
+
+def is_path_blocked_by_sun(
+    source_x,
+    source_y,
+    target_x,
+    target_y,
+    sun_radius=SUN_RADIUS
+):
+    dx, dy = target_x - source_x, target_y - source_y
+    if dx**2 + dy**2 <= 0:
+        return False
+    sx, sy = CENTER_X - source_x, CENTER_Y - source_y
+    t = max(0.0, min(1.0, (sx * dx + sy * dy) / (dx**2 + dy**2)))
+    return math.hypot(
+        (source_x + t * dx) - CENTER_X, (source_y + t * dy) - CENTER_Y
+    ) <= (sun_radius + 0.01)
+
+
+def get_routed_trajectory(sx, sy, tx, ty):
+    direct_dist = math.hypot(tx - sx, ty - sy)
+    if not is_path_blocked_by_sun(sx, sy, tx, ty):
+        return math.atan2(ty - sy, tx - sx), direct_dist
+
+    if direct_dist < 1e-9:
+        return math.atan2(ty - sy, tx - sx), direct_dist
+    nx, ny = -(ty - sy) / direct_dist, (tx - sx) / direct_dist
+    best_dist, best_angle = float("inf"), None
+
+    for sign in (1.0, -1.0):
+        for mult in (1.8, 2.3, 3.0, 4.0):
+            wx, wy = CENTER_X + sign * nx * (
+                SUN_RADIUS * mult
+            ), CENTER_Y + sign * ny * (SUN_RADIUS * mult)
+            if not is_path_blocked_by_sun(
+                sx, sy, wx, wy
+            ) and not is_path_blocked_by_sun(wx, wy, tx, ty):
+                routed_dist = math.hypot(wx - sx, wy - sy) + math.hypot(
+                    tx - wx, ty - wy
+                )
+                if routed_dist < best_dist:
+                    best_dist, best_angle = routed_dist, math.atan2(wy - sy, wx - sx)
+                break
+
+    if best_angle is not None:
+        return best_angle, best_dist
+    return math.atan2(ty - sy, tx - sx), direct_dist * 1.8
+
+
+def get_future_pos(planet, angular_velocity, t_arr, comets_data=None):
+    if comets_data:
+        for cg in comets_data:
+            if planet.id in cg.get("planet_ids", []):
+                p_idx = cg["planet_ids"].index(planet.id)
+                paths, t_idx = cg.get("paths", []), cg.get("path_index", 0) + t_arr
+                if p_idx < len(paths) and t_idx < len(paths[p_idx]):
+                    return paths[p_idx][t_idx][0], paths[p_idx][t_idx][1]
+                return -100, -100
+
+    dx, dy = planet.x - CENTER_X, planet.y - CENTER_Y
+    radius = math.hypot(dx, dy)
+    if radius + 1.0 >= 50.0 or angular_velocity == 0:
+        return planet.x, planet.y
+
+    theta = math.atan2(dy, dx) + (angular_velocity * t_arr)
+    return CENTER_X + radius * math.cos(theta), CENTER_Y + radius * math.sin(theta)
+
+
+def calculate_intercept(
+    source_pos,
+    target,
+    fleet_speed,
+    angular_velocity,
+    comets_data,
+    max_turns=120
+):
+    sx, sy = (source_pos.x, source_pos.y) if hasattr(source_pos, "x") else source_pos
+    for t in range(1, max_turns + 1):
+        future_x, future_y = get_future_pos(target, angular_velocity, t, comets_data)
+        if future_x < 0 or future_x > 100 or future_y < 0 or future_y > 100:
+            return None, None, None, None
+
+        launch_angle, total_dist = get_routed_trajectory(sx, sy, future_x, future_y)
+        if (fleet_speed * t) >= total_dist:
+            return launch_angle, t, future_x, future_y
+    return None, None, None, None
+
+
+def comet_remaining_life(planet_id, comets):
+    for g in comets:
+        if planet_id in g.get("planet_ids", []):
+            idx = g["planet_ids"].index(planet_id)
+            paths, t_idx = g.get("paths", []), g.get("path_index", 0)
+            if idx < len(paths):
+                return max(0, len(paths[idx]) - t_idx)
+    return 0
+
+
+# FAST 100-STEP ORACLE & ECONOMY
+def get_fleet_arrivals(planets, fleets, v_ang, comets_data):
+    arrivals = {p.id: [] for p in planets}
+    for f in fleets:
+        f_speed = calculate_fleet_speed(f.ships)
+        fdx, fdy = f_speed * math.cos(f.angle), f_speed * math.sin(f.angle)
+        best_t, best_p = 999, None
+
+        for p in planets:
+            if math.hypot(p.x - f.x, p.y - f.y) > (f_speed * 120) + 20:
+                continue
+            for t in range(1, 120):
+                fx, fy = f.x + fdx * t, f.y + fdy * t
+                if fx < 0 or fx > 100 or fy < 0 or fy > 100:
+                    break
+
+                px, py = get_future_pos(p, v_ang, t, comets_data)
+                if (fx - px) ** 2 + (fy - py) ** 2 <= (p.radius + 1.1) ** 2:
+                    if t < best_t:
+                        best_t, best_p = t, p
+                    break
+
+        if best_p:
+            arrivals[best_p.id].append((best_t, f.owner, f.ships))
+    return arrivals
+
+
+def get_safe_avail(planet, arrivals, player):
+    if planet.owner != player:
+        return 0
+    garrison, min_garrison, last_t = planet.ships, planet.ships, 0
+
+    for t, o, s in sorted(arrivals, key=lambda x: x[0]):
+        garrison += (t - last_t) * planet.production
+        last_t = t
+        if o == player:
+            garrison += s
+        else:
+            garrison -= s
+        if garrison < min_garrison:
+            min_garrison = garrison
+
+    return max(0, int(min_garrison))
+
+
+def get_defense_needed(planet, arrivals, player):
+    garrison, last_t, deficit = planet.ships, 0, 0
+    for t, o, s in sorted(arrivals, key=lambda x: x[0]):
+        garrison += (t - last_t) * planet.production
+        last_t = t
+        if o == player:
+            garrison += s
+        else:
+            garrison -= s
+            if garrison < 0:
+                deficit = max(deficit, -garrison)
+                garrison = 0
+    return int(deficit)
+
+
+def compute_defender(tgt, arrival_turns, arrivals, player):
+    if tgt.owner == -1:
+        defender = tgt.ships
+    elif tgt.owner == player:
+        return 0
+    else:
+        defender = tgt.ships + tgt.production * arrival_turns
+
+    for t, o, s in arrivals:
+        if t <= arrival_turns:
+            if o == tgt.owner:
+                defender += s
+            elif o == player:
+                defender -= s
+
+    return max(0, int(defender))
+
+
+# THE MATRIX AGENT
+class OrbitWarsAgent:
+    def _parse_obs(self, obs):
+        is_dict = isinstance(obs, dict)
+        return (
+            obs.get("player", 0) if is_dict else obs.player,
+            obs.get("step", 0) if is_dict else obs.step,
+            [Planet(*p) for p in (obs.get("planets", []) if is_dict else obs.planets)],
+            [Fleet(*f) for f in (obs.get("fleets", []) if is_dict else obs.fleets)],
+            obs.get("angular_velocity", 0.0) if is_dict else obs.angular_velocity,
+            (
+                obs.get("comet_planet_ids", [])
+                if is_dict
+                else getattr(obs, "comet_planet_ids", [])
+            ),
+            obs.get("comets", []) if is_dict else getattr(obs, "comets", []),
+        )
+
+    def __call__(self, obs):
+        moves = []
+        player, step, planets, fleets, v_ang, comet_ids, comets_data = self._parse_obs(
+            obs
+        )
+        my_p = [p for p in planets if p.owner == player]
+        targets = [p for p in planets if p.owner != player]
+        if not my_p:
+            return []
+
+        planet_by_id = {p.id: p for p in planets}
+        enemy_planets = [p for p in targets if p.owner != -1]
+        arrivals_by_planet = get_fleet_arrivals(planets, fleets, v_ang, comets_data)
+
+        # Macro Analytics
+        my_total = sum(p.ships for p in my_p) + sum(
+            f.ships for f in fleets if f.owner == player
+        )
+        enemy_totals = {}
+        for p in targets:
+            if p.owner != -1:
+                enemy_totals[p.owner] = enemy_totals.get(p.owner, 0) + p.ships
+        for f in fleets:
+            if f.owner not in [player, -1]:
+                enemy_totals[f.owner] = enemy_totals.get(f.owner, 0) + f.ships
+
+        strongest_enemy = max(enemy_totals.values()) if enemy_totals else 0
+        enemy_prod = sum(p.production for p in enemy_planets)
+
+        remaining_steps = max(1, TOTAL_STEPS - step)
+        is_early = step < 40
+        finishing = (
+            my_total > strongest_enemy * 1.30
+            and sum(p.production for p in my_p) > enemy_prod * 0.8
+            and step > 100
+        )
+
+        # Base Logistics
+        avail = {}
+        doomed = set()
+        for p in my_p:
+            need = get_defense_needed(p, arrivals_by_planet[p.id], player)
+            if need > p.ships + 5:
+                doomed.add(p.id)
+                avail[p.id] = p.ships
+            else:
+                avail[p.id] = get_safe_avail(p, arrivals_by_planet[p.id], player)
+
+        target_commitments = {p.id: 0 for p in planets}
+        for p in targets:
+            inbound = sum(s for t, o, s in arrivals_by_planet[p.id] if o == player)
+            target_commitments[p.id] = inbound
+
+        # Phase 1: Desperado Strike
+        for sid in list(doomed):
+            if avail[sid] <= 0:
+                continue
+            best_tgt, best_score, best_ang = None, -1, None
+
+            for tgt in targets:
+                if tgt.owner == -1:
+                    continue
+                ang, t_a, fx, fy = calculate_intercept(
+                    planet_by_id[sid],
+                    tgt,
+                    calculate_fleet_speed(avail[sid]),
+                    v_ang,
+                    comets_data,
+                )
+                if t_a and t_a < 40:
+                    needed = (
+                        compute_defender(tgt, t_a, arrivals_by_planet[tgt.id], player)
+                        + 1
+                    )
+                    if avail[sid] >= needed:
+                        score = tgt.production / (t_a + 1.0)
+                        if score > best_score:
+                            best_score, best_tgt, best_ang = score, tgt, ang
+
+            if best_tgt:
+                moves.append([sid, float(best_ang), avail[sid]])
+                target_commitments[best_tgt.id] += avail[sid]
+                avail[sid] = 0
+
+        # Phase 2: The Value Matrix
+        candidates = []
+        for src in my_p:
+            if avail[src.id] <= 0 or src.id in doomed:
+                continue
+
+            for tgt in targets:
+                my_dist = math.hypot(src.x - tgt.x, src.y - tgt.y)
+                if my_dist > 135:
+                    continue
+
+                f_speed = calculate_fleet_speed(max(10, avail[src.id]))
+                ang, t_a, fx, fy = calculate_intercept(
+                    src, tgt, f_speed, v_ang, comets_data
+                )
+                if not t_a or t_a > remaining_steps - 3:
+                    continue
+
+                needed = (
+                    compute_defender(tgt, t_a, arrivals_by_planet[tgt.id], player) + 1
+                )
+                if needed > avail[src.id] * 2.5:
+                    continue
+
+                turns_profit = max(1, remaining_steps - t_a)
+                if tgt.id in comet_ids:
+                    turns_profit = min(
+                        turns_profit, comet_remaining_life(tgt.id, comets_data)
+                    )
+
+                iw = 0.0
+                for p in planets:
+                    if p.id != tgt.id and math.hypot(tgt.x - p.x, tgt.y - p.y) >= 1.0:
+                        iw += (
+                            p.production / (math.hypot(tgt.x - p.x, tgt.y - p.y) + 10.0)
+                        ) * (
+                            0.5
+                            if p.owner == player
+                            else (1.0 if p.owner == -1 else 1.3)
+                        )
+
+                value = (tgt.production * turns_profit * 15.0) + (
+                    iw * turns_profit * 3.0
+                )
+
+                if tgt.owner != -1:
+                    value *= 2.0
+                    if finishing:
+                        value *= 1.5
+                    if tgt.ships < 15:
+                        value += 500
+                else:
+                    min_e_dist = min(
+                        [math.hypot(tgt.x - e.x, tgt.y - e.y) for e in enemy_planets]
+                        + [float("inf")]
+                    )
+                    if my_dist > min_e_dist - 2:
+                        value *= 0.25
+                    elif is_early:
+                        value *= 1.6
+
+                cost = needed + t_a * 0.5
+                score = value / (cost + 1.0)
+                candidates.append((score, src.id, tgt.id, ang, needed, t_a))
+
+        # Phase 3: Greedy Organic Dispatch
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for score, sid, tid, ang, needed, t_a in candidates:
+            if avail[sid] <= 0:
+                continue
+
+            missing = max(0, needed - target_commitments[tid])
+            if missing <= 0:
+                continue
+
+            send = min(avail[sid], missing)
+            if send >= missing or send >= avail[sid] * 0.8:
+                moves.append([sid, float(ang), int(send)])
+                avail[sid] -= send
+                target_commitments[tid] += send
+
+        # Phase 4: Frontline Funneling
+        if enemy_planets and len(my_p) > 1:
+            front_scores = {
+                p.id: sum(
+                    e.production / (math.hypot(p.x - e.x, p.y - e.y) + 1.0)
+                    for e in enemy_planets
+                )
+                for p in my_p
+            }
+            best_front = max(my_p, key=lambda p: front_scores[p.id])
+
+            for r in my_p:
+                if r.id == best_front.id or avail[r.id] < 15 or r.id in doomed:
+                    continue
+                if front_scores[r.id] < front_scores[best_front.id] * 0.4:
+                    send = int(avail[r.id] * 0.65)
+                    ang, t_a, fx, fy = calculate_intercept(
+                        r, best_front, calculate_fleet_speed(send), v_ang, comets_data
+                    )
+                    if t_a and t_a <= 50:
+                        moves.append([r.id, float(ang), int(send)])
+                        avail[r.id] -= send
+
+        # Final Dedup Capping
+        dedup = {}
+        for sid, ang, sh in moves:
+            key = (sid, round(ang, 4))
+            dedup[key] = dedup.get(key, 0) + sh
+
+        final_moves, used = [], {}
+        for (sid, ang), sh in dedup.items():
+            max_avail = planet_by_id[sid].ships - used.get(sid, 0)
+            send = min(sh, max_avail)
+            if send >= 1:
+                final_moves.append([sid, float(ang), int(send)])
+                used[sid] = used.get(sid, 0) + send
+
+        return final_moves
+
+
+configured_agent = OrbitWarsAgent()
+
+
+def agent(obs):
+    return configured_agent(obs)
+Writing submission.py
+Play vs. Random Agent
+from kaggle_environments import make
+
+env = make("orbit_wars", debug=True)
+
+# Run match: Our Agent vs Random
+env.run(["submission.py", "random"])
+
+for i, state in enumerate(env.steps[-1]):
+    print(f"Player {i} Status: {state.status}, Reward: {state.reward}")
+
+env.render(mode="ipython", width=800, height=600)
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: Successfully loaded OpenSpiel environments: 16.
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_backgammon
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_checkers
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_chess
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_connect_four
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_gin_rummy
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_go
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_goofspiel
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hearts
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hex
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_matching_pennies_3p
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_othello
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_game
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_tic_tac_toe
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_universal_poker
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_poker
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_python_repeated_pokerkit
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: OpenSpiel games skipped: 1.
+[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    snake
+Player 0 Status: DONE, Reward: 1
+Player 1 Status: DONE, Reward: -1
+
+ 

@@ -1,0 +1,71 @@
+%%writefile submission.py
+import math
+
+def agent(obs):
+    moves = []
+    
+    player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
+    raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
+    
+    class SimplePlanet:
+        def __init__(self, id, owner, x, y, radius, ships, production):
+            self.id = id
+            self.owner = owner
+            self.x = x
+            self.y = y
+            self.radius = radius
+            self.ships = ships
+            self.production = production
+
+    planets = [SimplePlanet(*p) for p in raw_planets]
+    my_planets = [p for p in planets if p.owner == player]
+    targets = [p for p in planets if p.owner != player]
+    
+    def intersects_sun(x1, y1, x2, y2, sun_x=50, sun_y=50, sun_r=10.5):
+        line_len_sq = (x2 - x1)**2 + (y2 - y1)**2
+        if line_len_sq == 0: return False
+        t = max(0, min(1, ((sun_x - x1)*(x2 - x1) + (sun_y - y1)*(y2 - y1)) / line_len_sq))
+        proj_x = x1 + t * (x2 - x1)
+        proj_y = y1 + t * (y2 - y1)
+        dist = math.sqrt((sun_x - proj_x)**2 + (sun_y - proj_y)**2)
+        return dist <= sun_r
+
+    for mine in my_planets:
+        if mine.ships < 30:
+            continue
+            
+        best_target = None
+        best_score = -float('inf')
+        ships_to_send = 0
+        
+        for t in targets:
+            dist = math.sqrt((mine.x - t.x)**2 + (mine.y - t.y)**2)
+            if dist == 0: continue
+            
+            if intersects_sun(mine.x, mine.y, t.x, t.y):
+                continue
+                
+            travel_time = dist / 5.0
+            
+            future_ships = t.ships
+            if t.owner != -1:
+                future_ships += int(t.production * travel_time)
+                
+            required_ships = future_ships + 1
+            if t.owner != -1:
+                required_ships += 5
+                
+            if mine.ships >= required_ships:
+                score = t.production / (dist * 0.5 + required_ships)
+                
+                if score > best_score:
+                    best_score = score
+                    best_target = t
+                    ships_to_send = required_ships
+                    
+        if best_target:
+            angle = math.atan2(best_target.y - mine.y, best_target.x - mine.x)
+            moves.append([mine.id, angle, ships_to_send])
+            
+    return moves
+Writing submission.pyw

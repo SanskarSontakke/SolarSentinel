@@ -1,0 +1,213 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+# Use the kagglehub client library to attach Kaggle resources like competitions, datasets, and models to your session
+# Learn more about kagglehub: https://github.com/Kaggle/kagglehub/blob/main/README.md
+
+import kagglehub
+# kagglehub.dataset_download('<owner>/<dataset-slug>')
+/kaggle/input/competitions/orbit-wars/main.py
+/kaggle/input/competitions/orbit-wars/README.md
+/kaggle/input/competitions/orbit-wars/agents.md
+%%writefile submission.py
+import math
+
+# ==========================================
+# CONFIGURATION & CONSTANTS
+# ==========================================
+CENTER_X, CENTER_Y = 50.0, 50.0
+SUN_RADIUS = 10.5
+MAX_SPEED = 2.0  
+
+# Global dictionary to track planet angles across turns for velocity calculations
+past_planet_angles = {}
+
+# ==========================================
+# CUSTOM CLASSES (Bypasses Kaggle Imports)
+# ==========================================
+class Planet:
+    def __init__(self, *args):
+        # Based on standard observation format: [id, owner, x, y, radius, ships, production]
+        self.id = args[0]
+        self.owner = args[1]
+        self.x = args[2]
+        self.y = args[3]
+        self.radius = args[4]
+        self.ships = args[5]
+        self.production = args[6]
+
+class Fleet:
+    def __init__(self, *args):
+        # Extracting from the end to ensure we get the right values regardless of ID inclusion
+        self.direction = args[-1]
+        self.ships = args[-2]
+        self.y = args[-3]
+        self.x = args[-4]
+        self.owner = args[-5]
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def intersects_sun(x1, y1, x2, y2):
+    """Calculates if a line segment between two points intersects the Sun's radius."""
+    dx, dy = x2 - x1, y2 - y1
+    fx, fy = x1 - CENTER_X, y1 - CENTER_Y
+    
+    a = dx*dx + dy*dy
+    if a == 0: 
+        return False
+        
+    b = 2 * (fx*dx + fy*dy)
+    c = (fx*fx + fy*fy) - SUN_RADIUS*SUN_RADIUS
+    
+    discriminant = b*b - 4*a*c
+    if discriminant < 0: 
+        return False  
+    
+    discriminant = math.sqrt(discriminant)
+    t1 = (-b - discriminant) / (2*a)
+    t2 = (-b + discriminant) / (2*a)
+    
+    return (0 <= t1 <= 1) or (0 <= t2 <= 1)
+
+def get_angle_from_center(x, y):
+    """Gets the angle of a point relative to the board's center."""
+    return math.atan2(y - CENTER_Y, x - CENTER_X)
+
+def calculate_fleet_speed(num_ships):
+    """Calculates fleet speed using the competition's logarithmic scaling formula."""
+    ships_val = max(1.1, num_ships)
+    speed = 1.0 + (MAX_SPEED - 1.0) * ((math.log(ships_val) / math.log(1000)) ** 1.5)
+    return min(speed, MAX_SPEED) 
+
+def normalize_angle(angle):
+    """Normalizes an angle to be strictly between -pi and pi."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+# ==========================================
+# MAIN AGENT LOGIC
+# ==========================================
+def agent(obs):
+    global past_planet_angles
+    
+    # 1. Parse Environment State
+    planets = [Planet(*p) for p in obs.get("planets", [])]
+    fleets = [Fleet(*f) for f in obs.get("fleets", [])]
+    player = obs.get("player", 0)
+    
+    my_planets = [p for p in planets if p.owner == player]
+    enemy_planets = [p for p in planets if p.owner != player]
+    enemy_fleets = [f for f in fleets if f.owner != player]
+    
+    actions = []
+    evacuating_planets = set()
+    
+    # 2. Update Orbital Mechanics Tracking
+    omegas = {}
+    for p in planets:
+        current_angle = get_angle_from_center(p.x, p.y)
+        if p.id in past_planet_angles:
+            # Calculate angular velocity based on movement since last turn
+            diff = normalize_angle(current_angle - past_planet_angles[p.id])
+            omegas[p.id] = diff
+        else:
+            # First turn approximation: Inner planets move, outer planets are static
+            dist_to_sun = math.hypot(p.x - CENTER_X, p.y - CENTER_Y)
+            omegas[p.id] = 0.035 if dist_to_sun < 45 else 0.0
+            
+        past_planet_angles[p.id] = current_angle
+
+    # 3. Defensive Logistics (Evacuation Protocols)
+    for p in my_planets:
+        for f in enemy_fleets:
+            # Determine if the enemy fleet's trajectory is pointed at our planet
+            angle_to_planet = math.atan2(p.y - f.y, p.x - f.x)
+            angle_diff = abs(normalize_angle(angle_to_planet - f.direction))
+            
+            # 0.1 radians is an approximate margin for collision course
+            if angle_diff < 0.1:
+                dist = math.hypot(p.x - f.x, p.y - f.y)
+                enemy_speed = calculate_fleet_speed(f.ships)
+                turns_to_impact = dist / enemy_speed
+                
+                # Predict our total ships at the exact moment of impact
+                defending_ships = p.ships + (p.production * turns_to_impact)
+                
+                # Evacuate if defense is impossible
+                if f.ships > defending_ships:
+                    evacuating_planets.add(p.id)
+                    safe_planets = [sp for sp in my_planets if sp.id != p.id]
+                    if safe_planets:
+                        # Flee to the absolute closest safe planet
+                        escape_target = min(safe_planets, key=lambda sp: math.hypot(sp.x - p.x, sp.y - p.y))
+                        escape_angle = math.atan2(escape_target.y - p.y, escape_target.x - p.x)
+                        actions.append([p.id, escape_angle, p.ships])
+                    break 
+    
+    # 4. Offensive Logistics (Targeting & Prediction)
+    for p in my_planets:
+        if p.id in evacuating_planets:
+            continue 
+            
+        # Keep a garrison relative to the planet's value (production rate)
+        garrison = 5 + (p.production * 2) 
+        
+        # Launch conditions
+        if p.ships > garrison + 10:
+            ships_to_send = p.ships - garrison
+            fleet_speed = calculate_fleet_speed(ships_to_send)
+            
+            best_target = None
+            best_score = -float('inf')
+            best_aim_angle = 0
+            
+            for target in enemy_planets:
+                tx, ty = target.x, target.y
+                omega = omegas.get(target.id, 0.0)
+                orbit_radius = math.hypot(tx - CENTER_X, ty - CENTER_Y)
+                
+                # Iterative convergence for target lead time (3 passes)
+                t_flight = math.hypot(tx - p.x, ty - p.y) / fleet_speed
+                fx, fy = tx, ty
+                
+                for _ in range(3):
+                    future_angle = get_angle_from_center(tx, ty) + (omega * t_flight)
+                    fx = CENTER_X + orbit_radius * math.cos(future_angle)
+                    fy = CENTER_Y + orbit_radius * math.sin(future_angle)
+                    t_flight = math.hypot(fx - p.x, fy - p.y) / fleet_speed
+                
+                # Ensure the predicted path does not incinerate the fleet in the Sun
+                if not intersects_sun(p.x, p.y, fx, fy):
+                    # Factor in target's passive production during our flight time
+                    projected_enemy_ships = target.ships + (target.production * t_flight)
+                    
+                    if ships_to_send > projected_enemy_ships + 5:
+                        # Score is weighted heavily towards high-production planets that are nearby
+                        score = target.production - (t_flight * 0.5) 
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_target = target
+                            best_aim_angle = math.atan2(fy - p.y, fx - p.x)
+            
+            # Commit the launch action
+            if best_target:
+                actions.append([p.id, best_aim_angle, ships_to_send])
+                
+    return actions
+Writing submission.py
