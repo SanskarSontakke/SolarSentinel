@@ -83,25 +83,40 @@ def save_snapshot(version: int) -> Path:
 #  MODE 1: ARENA (ELO-rated self-play)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class OpponentPool:
-    def __init__(self, max_size: int = 5):
+class LeaguePool:
+    def __init__(self, max_size: int = 8):
         self.max_size = max_size
-        self.versions: list[int] = []
-        self.agents_paths: dict[int, Path] = {}
+        self.agents: list[tuple[int, Path, float]] = [] # (version, path, elo)
 
-    def add(self, version: int, path: Path):
-        self.versions.append(version)
-        self.agents_paths[version] = path
-        while len(self.versions) > self.max_size:
-            old = self.versions.pop(0)
-            del self.agents_paths[old]
+    def add(self, version: int, path: Path, elo: float):
+        if not self.agents:
+            self.agents.append((version, path, elo))
+            return True
+        
+        avg_elo = sum(a[2] for a in self.agents) / len(self.agents)
+        if elo < avg_elo + 10:
+            print(f"  [LEAGUE] Snapshot v{version} (ELO {elo:.0f}) below avg+10 threshold ({avg_elo+10:.0f}). Skipped.")
+            return False
+        
+        self.agents.append((version, path, elo))
+        self.agents.sort(key=lambda x: x[2], reverse=True)
+        if len(self.agents) > self.max_size:
+            removed = self.agents.pop()
+            print(f"  [LEAGUE] Pruned v{removed[0]} (ELO {removed[2]:.0f})")
+        return True
 
     def pick(self) -> tuple[int, Path]:
-        if not self.versions:
-            # Fallback to agent_v0 if pool is empty
+        if not self.agents:
             return 0, SNAPSHOTS_DIR / "agent_v0.py"
-        ver = random.choice(self.versions)
-        return ver, self.agents_paths[ver]
+        
+        r = random.random()
+        if r < 0.2: # 20% Baseline
+            return 0, SNAPSHOTS_DIR / "agent_v0.py"
+        elif r < 0.6: # 40% Highest ELO
+            return self.agents[0][0], self.agents[0][1]
+        else: # 40% Random from pool
+            choice = random.choice(self.agents)
+            return choice[0], choice[1]
 
 
 class ELOTracker:
@@ -138,6 +153,56 @@ class ELOTracker:
             d = json.loads(ELO_FILE.read_text())
             self.ratings = {k: float(v) for k, v in d.get("ratings", {}).items()}
             self.history = d.get("history", [])
+
+
+def read_cfg_from_submission():
+    """Extract current CFG dictionary from submission.py using regex."""
+    if not SUBMISSION_FILE.exists(): return {}
+    src = SUBMISSION_FILE.read_text()
+    pattern = r'CFG = \{([^}]+)\}'
+    match = re.search(pattern, src)
+    if not match: return {}
+    
+    lines = match.group(1).split("\n")
+    cfg = {}
+    for line in lines:
+        line_m = re.search(r'"([^"]+)":\s*([0-9\.-]+)', line)
+        if line_m:
+            cfg[line_m.group(1)] = float(line_m.group(2))
+    return cfg
+
+
+def run_mini_tournament(n_workers):
+    """Run a round-robin tournament between all snapshots to find the true best."""
+    print("\n" + "═"*70)
+    print("  Snapshot Mini-Tournament (Round Robin)")
+    print("═"*70)
+    snaps = sorted(list(SNAPSHOTS_DIR.glob("agent_v*.py")))
+    if len(snaps) < 2: 
+        return snaps[0] if snaps else None
+    
+    from collections import defaultdict
+    wins_count = defaultdict(float)
+    pairs = []
+    
+    # 2p tournament
+    for i in range(len(snaps)):
+        for j in range(i + 1, len(snaps)):
+            for g in range(10): # 10 games each pair
+                pairs.append((str(snaps[i]), str(snaps[j]), g, (snaps[i], snaps[j])))
+    
+    print(f"  Running {len(pairs)} tournament games...")
+    with multiprocessing.Pool(n_workers) as pool:
+        all_res = pool.map(_eval_worker, pairs)
+        
+    for won, lead, (p_a, p_b) in all_res:
+        if won == 1: wins_count[p_a] += 1
+        elif won == 0: wins_count[p_b] += 1
+        else: wins_count[p_a] += 0.5; wins_count[p_b] += 0.5
+        
+    best_agent_path = max(wins_count.keys(), key=lambda k: wins_count[k])
+    print(f"  Tournament winner: {best_agent_path.name} with {wins_count[best_agent_path]} wins.")
+    return best_agent_path
 
 
 # ── Batch game evaluation ─────────────────────────────────────────────────────
@@ -186,29 +251,29 @@ def run_arena(args):
     print("=" * 70)
     print(f"  Max games:       {args.games}")
     print(f"  Snapshot every:  {args.snapshot_every}")
-    print(f"  Pool size:       {args.pool_size}")
-    print(f"  Batch size:      24")
+    print(f"  League size:     8")
+    print(f"  Batch size:      48")
     print("=" * 70)
 
     elo = ELOTracker(k=args.elo_k); elo.load()
-    pool = OpponentPool(max_size=args.pool_size)
+    pool = LeaguePool(max_size=8)
+    elo_readings = deque(maxlen=50)
 
     # Initial setup
     v0_path = SNAPSHOTS_DIR / "agent_v0.py"
     if not v0_path.exists():
         save_snapshot(0)
-    pool.add(0, v0_path)
+    pool.add(0, v0_path, elo.get("v0"))
     
     ver = 0
     wins, losses, draws = 0, 0, 0
-    recent_elos = deque(maxlen=args.stagnation)
     t0 = time.time()
     n_workers = multiprocessing.cpu_count()
     
     print(f"\n  Starting arena at ELO {elo.get('current'):.0f}\n" + "-" * 70)
 
-    # Run in batches of 24 games to keep it parallel
-    batch_size = 24
+    # Run in batches of 48 games to better saturate TPU workers
+    batch_size = 48
     for batch_start in range(1, args.games + 1, batch_size):
         jobs = []
         batch_end = min(batch_start + batch_size - 1, args.games)
@@ -221,8 +286,6 @@ def run_arena(args):
             results = p.map(_eval_worker, jobs)
 
         for won, lead, ov in results:
-            # result: 0 if A wins, 1 if B wins, -1 if draw
-            # won: 1 if A, 0 if B, 0.5 if draw
             res_val = 0 if won == 1 else (1 if won == 0 else -1)
             elo.update("current", f"v{ov}", res_val)
             
@@ -230,27 +293,42 @@ def run_arena(args):
             elif won == 0: losses += 1
             else: draws += 1
             
-            ce = elo.get("current"); recent_elos.append(ce)
+            ce = elo.get("current")
+            elo_readings.append(ce)
             
         elo.save()
-        last_ov = results[-1][2]
         last_won = results[-1][0]
-        tag = "WIN " if last_won == 1 else ("LOSS" if last_won == 0 else "DRAW")
         
         print(f"  Batch {batch_start:4d}-{batch_end:4d} | ELO: {ce:7.0f} | W/L/D: {wins}/{losses}/{draws} | "
               f"{time.time()-t0:.0f}s")
 
-        # Snapshot logic - check if we passed a threshold
+        # League Snapshot Admission Logic
         if (batch_end // args.snapshot_every) > (batch_start // args.snapshot_every):
             ver += 1
             v_path = save_snapshot(ver)
-            pool.add(ver, v_path)
-            elo.ratings[f"v{ver}"] = ce
-            print(f"  [POOL] +v{ver} (ELO {ce:.0f})")
+            if pool.add(ver, v_path, ce):
+                elo.ratings[f"v{ver}"] = ce
+                print(f"  [POOL] v{ver} added to league.")
 
-        if len(recent_elos) >= args.stagnation:
-            if max(recent_elos) - min(recent_elos) < 5.0:
-                print(f"\n  [STOP] ELO stagnated."); break
+        # ELO Convergence Detection (std_dev < 3.0 over 50 readings)
+        if len(elo_readings) >= 50:
+            std_dev = np.std(elo_readings)
+            if std_dev < 3.0:
+                print(f"\n  [STOP] ELO converged (std_dev={std_dev:.2f} < 3.0)."); break
+
+    # Post-arena logic
+    final_elo = elo.get("current")
+    if final_elo > 1050:
+        current_cfg = read_cfg_from_submission()
+        if current_cfg:
+            inject_cfg_into_submission(current_cfg)
+            print(f"  [AUTO-INJECT] Final ELO {final_elo:.0f} > 1050. Optimized CFG finalized.")
+
+    # Mini-Tournament to find TRUE BEST
+    best_snap = run_mini_tournament(n_workers)
+    if best_snap:
+        print(f"\n  [DEPLOY] Promoting {best_snap.name} to submission.py as ultimate winner.")
+        shutil.copy2(best_snap, SUBMISSION_FILE)
 
     elapsed = time.time() - t0
     print("\n" + "=" * 70)
@@ -275,8 +353,8 @@ PARAM_SPACE = {
     "cost_turns_weight":             (0.1, 2.0),
     "funnel_finishing_ratio":        (0.5, 0.95),
     "funnel_ratio":                  (0.3, 0.85),
-    "sim_horizon":                   (10.0, 60.0),
-    "fleet_discount":                (0.8, 1.0),
+    "finishing_threshold":           (0.20, 0.50),
+    "desperate_threshold":           (-0.40, -0.10),
 }
 
 PARAM_NAMES = list(PARAM_SPACE.keys())
@@ -294,8 +372,8 @@ DEFAULT_CFG = {
     "cost_turns_weight": 0.35,
     "funnel_finishing_ratio": 0.75,
     "funnel_ratio": 0.60,
-    "sim_horizon": 30.0,
-    "fleet_discount": 0.95,
+    "finishing_threshold": 0.35,
+    "desperate_threshold": -0.25,
 }
 
 
@@ -348,6 +426,10 @@ def make_temp_agent(cfg: dict, idx: int) -> Path:
     # Use regex to replace the CFG dict block
     pattern = r'    CFG = \{[^}]+\}'
     new_src = re.sub(pattern, cfg_str, src, count=1)
+
+    # Threshold injections
+    new_src = re.sub(r'finishing = dom > 0\.\d+ and', f'finishing = dom > {cfg["finishing_threshold"]:.4f} and', new_src)
+    new_src = re.sub(r'behind = dom < -0\.\d+', f'behind = dom < {cfg["desperate_threshold"]:.4f}', new_src)
 
     dest = TEMP_DIR / f"candidate_{idx}.py"
     dest.write_text(new_src)
@@ -406,10 +488,12 @@ def run_evolution(args):
     best_vec = cfg_to_vec(best_cfg)
     sigma = args.sigma
 
-    # Parents: start with 2 copies of the default
-    parent_vecs = [cfg_to_vec(DEFAULT_CFG), cfg_to_vec(DEFAULT_CFG)]
+    # Parent: start with the default
+    parent_vecs = [cfg_to_vec(DEFAULT_CFG)]
 
     history = []
+    evo_snapshots = []
+    evo_ver = 0
     stagnation_counter = 0
     n_workers = max(1, multiprocessing.cpu_count() - 1)
     t0 = time.time()
@@ -424,14 +508,12 @@ def run_evolution(args):
         # ── Generate population ───────────────────────────────────────────
         population = []
 
-        # Keep parents unchanged (elitism)
-        for pi, pv in enumerate(parent_vecs):
-            population.append(vec_to_cfg(pv))
+        # Keep parent (elitism)
+        population.append(vec_to_cfg(parent_vecs[0]))
 
-        # Fill rest with mutations from random parents
+        # Fill rest with mutations from the top parent
         while len(population) < args.pop_size:
-            parent = parent_vecs[rng.integers(0, len(parent_vecs))]
-            child = mutate_around(parent, sigma, rng)
+            child = mutate_around(parent_vecs[0], sigma, rng)
             population.append(child)
 
         # ── Evaluate population in one massive batch ──────────────────────
@@ -445,8 +527,11 @@ def run_evolution(args):
             cand_path = make_temp_agent(cfg, i)
             cand_paths.append(cand_path)
             
-            # Use random snapshot for evaluation (ensure agent_v0 exists)
-            opp_choice = random.choice(snapshot_files) if snapshot_files else snapshot_files[0]
+            # Opponent selection logic: 50% chance for rolling snapshot, 50% for base v0
+            if evo_snapshots and random.random() < 0.5:
+                opp_choice = random.choice(evo_snapshots)
+            else:
+                opp_choice = SNAPSHOTS_DIR / "agent_v0.py"
             
             for g in range(args.games_per_eval):
                 all_jobs.append((str(cand_path), str(opp_choice), g, i))
@@ -464,18 +549,17 @@ def run_evolution(args):
         for i, res_list in enumerate(results_by_cand):
             wr = sum(r[0] for r in res_list) / len(res_list)
             avg_lead = sum(r[1] for r in res_list) / len(res_list)
-            score = wr * 100 + avg_lead / 50.0
+            score = wr * 150 + avg_lead / 30.0
             scores.append(score)
 
-            tag = "★" if i < len(parent_vecs) else " "
+            tag = "★" if i == 0 else " "
             print(f"    {tag} [{i+1:2d}/{args.pop_size}]  "
                   f"WR: {wr*100:5.1f}%  Lead: {avg_lead:+7.0f}  "
                   f"Score: {score:7.1f}")
 
-        # ── Selection: top 2 become parents ───────────────────────────────
+        # ── Selection: top 1 becomes parent ───────────────────────────────
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        parent_vecs = [cfg_to_vec(population[ranked[0]]),
-                       cfg_to_vec(population[ranked[1]])]
+        parent_vecs = [cfg_to_vec(population[ranked[0]])]
 
         gen_best_score = scores[ranked[0]]
         gen_best_cfg = population[ranked[0]]
@@ -487,8 +571,21 @@ def run_evolution(args):
             best_cfg = deepcopy(gen_best_cfg)
             best_vec = cfg_to_vec(best_cfg)
             stagnation_counter = 0
+            
+            # Add to rolling opponent pool
+            evo_ver += 1
+            snap_path = SNAPSHOTS_DIR / f"agent_evo_v{evo_ver}.py"
+            snap_path.write_text(make_temp_agent(best_cfg, 999).read_text())
+            evo_snapshots.append(snap_path)
+            print(f"    [SNAPSHOT] Added new best to evo pool: v{evo_ver}")
         else:
             stagnation_counter += 1
+
+        # Stagnation reset logic
+        if stagnation_counter == 3:
+            sigma = min(sigma * 2.0, args.sigma)
+            stagnation_counter = 0
+            print(f"    [RESET] Stagnation detected. Boosting sigma to {sigma:.4f}")
 
         # Decay sigma
         sigma *= args.sigma_decay
@@ -516,8 +613,8 @@ def run_evolution(args):
                         "history": history}, f, indent=2)
 
         # ── Early stop ────────────────────────────────────────────────────
-        if stagnation_counter >= 5:
-            print(f"\n  [STOP] No improvement in 5 generations. Stopping.")
+        if stagnation_counter >= 8:
+            print(f"\n  [STOP] Stagnation limit reached (8). Stopping.")
             break
 
     # ── Cleanup temp files ────────────────────────────────────────────────

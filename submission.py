@@ -14,18 +14,6 @@ Hybrid architecture (best of references 5, 6, 8):
   - Indirect wealth scoring (ref 5/6)
 """
 
-import logging
-import warnings
-
-# Force silence all INFO logs from kaggle_environments and absl
-logging.getLogger("kaggle_environments").setLevel(logging.WARNING)
-try:
-    from absl import logging as absl_logging
-    absl_logging.set_verbosity(absl_logging.ERROR)
-except ImportError:
-    pass
-logging.disable(logging.INFO)
-warnings.filterwarnings("ignore")
 import math
 from collections import defaultdict
 
@@ -378,174 +366,30 @@ def _reaction_time(tgt, my_planets, enemy_planets):
     return my_t, en_t
 
 
-# ═══ Forward Simulation ═══════════════════════════════════════════════════════
-
-class SimFleet:
-    __slots__ = ['owner', 'target_id', 'ships', 'eta']
-    def __init__(self, owner, target_id, ships, eta):
-        self.owner = owner
-        self.target_id = target_id
-        self.ships = ships
-        self.eta = eta
-
-class SimState:
-    __slots__ = ['planets', 'fleets', 'geo']
-    
-    def __init__(self):
-        self.planets = {}  # pid -> [owner, ships, production]
-        self.fleets = []   # SimFleet list
-        self.geo = {}      # pid -> (x, y)
-        
-    def clone(self):
-        c = SimState()
-        c.planets = {k: v.copy() for k, v in self.planets.items()}
-        c.fleets = [SimFleet(f.owner, f.target_id, f.ships, f.eta) for f in self.fleets]
-        c.geo = self.geo
-        return c
-        
-    def step(self):
-        for pid, pdata in self.planets.items():
-            if pdata[0] != -1:
-                pdata[1] += pdata[2]
-                
-        for f in self.fleets:
-            f.eta -= 1
-            
-        arriving = [f for f in self.fleets if f.eta <= 0]
-        self.fleets = [f for f in self.fleets if f.eta > 0]
-        
-        if not arriving:
-            return
-            
-        arrivals_by_planet = defaultdict(list)
-        for f in arriving:
-            arrivals_by_planet[f.target_id].append(f)
-            
-        for pid, arriving_fleets in arrivals_by_planet.items():
-            if pid not in self.planets: continue
-            pdata = self.planets[pid]
-            current_owner = pdata[0]
-            
-            forces = defaultdict(int)
-            for f in arriving_fleets:
-                forces[f.owner] += f.ships
-            forces[current_owner] += pdata[1]
-            
-            if not forces: continue
-            
-            sorted_forces = sorted(forces.items(), key=lambda x: x[1], reverse=True)
-            if len(sorted_forces) == 1:
-                pdata[0] = sorted_forces[0][0]
-                pdata[1] = sorted_forces[0][1]
-            else:
-                rem = sorted_forces[0][1] - sorted_forces[1][1]
-                pdata[1] = rem
-                if rem > 0:
-                    pdata[0] = sorted_forces[0][0]
-
-def evaluate_moves(moves_list, sim_state, player, horizon=5, discount=1.0):
-    state = sim_state.clone()
-    
-    for move in moves_list:
-        if len(move) >= 5:
-            src_id, ang, ships, target_id, eta = move[:5]
-        else:
-            src_id, ang, ships = move
-            src_x, src_y = state.geo[src_id]
-            target_id = None
-            best_dist = 1e9
-            cx, cy = math.cos(ang), math.sin(ang)
-            for pid, (px, py) in state.geo.items():
-                if pid == src_id: continue
-                dx, dy = px - src_x, py - src_y
-                dist = math.hypot(dx, dy)
-                if dist < 1e-4: continue
-                if (dx * cx + dy * cy) / dist > 0.999:
-                    if dist < best_dist:
-                        best_dist = dist
-                        target_id = pid
-            eta = max(1, math.ceil(best_dist / 6.0)) if target_id is not None else 1000
-            
-        if target_id is not None:
-            state.fleets.append(SimFleet(player, target_id, ships, eta))
-            if src_id in state.planets and state.planets[src_id][0] == player:
-                state.planets[src_id][1] = max(0, state.planets[src_id][1] - ships)
-
-    for _ in range(horizon):
-        state.step()
-        
-    my_score = 0
-    en_score = 0
-    for pid, pdata in state.planets.items():
-        owner, ships, prod = pdata
-        val = ships + 40 * prod
-        if owner == player:
-            my_score += val
-        elif owner != -1:
-            en_score += val
-            
-    # Score ships in flight with discount factor relative to arrival time
-    friendly_in_flight = 0
-    for f in state.fleets:
-        if f.owner == player:
-            f_val = f.ships * (discount ** (f.eta / 10.0))
-            friendly_in_flight += f_val
-            
-    enemy_in_flight = sum(f.ships for f in state.fleets if f.owner != player)
-            
-    return (my_score + friendly_in_flight) - (en_score + 1.0 * enemy_in_flight)
-
-def select_best_move_set(candidates, sim_state, player, CFG):
-    if not candidates:
-        return []
-        
-    import time as _time_mod
-    t0 = _time_mod.time()
-    best_score = -1e9
-    best_moves = candidates[0]
-    
-    horizon = int(CFG.get("sim_horizon", 30))
-    discount = CFG.get("fleet_discount", 0.95)
-    
-    for i, moves_list in enumerate(candidates):
-        score = evaluate_moves(moves_list, sim_state, player, horizon=horizon, discount=discount)
-        if i == 0: score += 0.05
-            
-        if score > best_score:
-            best_score = score
-            best_moves = moves_list
-            
-        if (_time_mod.time() - t0) > 0.140: break
-            
-    return [[m[0], float(m[1]), int(m[2])] for m in best_moves]
-
 # ═══ Main Agent ═══════════════════════════════════════════════════════════════
 
 def agent(obs, override_config=None):
     CFG = {
-        "enemy_multiplier": 1.8500,
-        "finishing_multiplier": 2.2000,
-        "early_neutral_multiplier": 1.9000,
-        "safe_neutral_early_multiplier": 1.2500,
-        "contested_neutral_penalty": 0.3500,
-        "prod_weight": 19.0000,
-        "iw_weight": 2.0000,
-        "contested_margin": 1.8000,
-        "cost_turns_weight": 0.3500,
-        "funnel_finishing_ratio": 0.7500,
-        "funnel_ratio": 0.6000,
-        "sim_horizon": 30.0,
-        "fleet_discount": 0.9500,
+        "enemy_multiplier": 2.0,
+        "finishing_multiplier": 1.5,
+        "early_neutral_multiplier": 1.6,
+        "safe_neutral_early_multiplier": 1.4,
+        "contested_neutral_penalty": 0.25,
+        "prod_weight": 15.0,
+        "iw_weight": 3.0,
+        "contested_margin": 1.4,
+        "cost_turns_weight": 0.5,
+        "funnel_finishing_ratio": 0.80,
+        "funnel_ratio": 0.65,
     }
     if override_config is not None:
         CFG.update(override_config)
 
-    import time as _time_mod
-    _agent_t0 = _time_mod.time()
-
     # ── Parse observation ─────────────────────────────────────────────────────
-    if isinstance(obs, dict): get = obs.get
-    else: get = lambda k, d=None: getattr(obs, k, d)
+    if isinstance(obs, dict):
+        get = obs.get
+    else:
+        get = lambda k, d=None: getattr(obs, k, d)
 
     player    = get("player", 0)
     step      = get("step", 0) or 0
@@ -557,24 +401,16 @@ def agent(obs, override_config=None):
     comet_ids = set(get("comet_planet_ids", []) or [])
     p_by_id   = {p.id: p for p in planets}
 
-    sim_state = SimState()
-    for p in planets:
-        sim_state.planets[p.id] = [p.owner, p.ships, p.production]
-        sim_state.geo[p.id] = (p.x, p.y)
-    for f in fleets:
-        target_p, t = _fleet_dest(f, planets)
-        if target_p: sim_state.fleets.append(SimFleet(f.owner, target_p.id, f.ships, t))
-
-    n_players = len(set(p.owner for p in planets if p.owner != -1)) + len(set(f.owner for f in fleets if f.owner != -1))
-    is_4p = (n_players > 2) or (player > 1)
-
     mine    = [p for p in planets if p.owner == player]
-    if not mine: return []
+    if not mine:
+        return []
     enemy   = [p for p in planets if p.owner not in (-1, player)]
+    neutral = [p for p in planets if p.owner == -1]
     tgts    = [p for p in planets if p.owner != player]
 
     rem   = max(1, TOTAL_STEPS - step)
     early = step < 40
+    mid_early = step < 80
     late  = rem < 60
     vlate = rem < 25
 
@@ -584,137 +420,360 @@ def agent(obs, override_config=None):
     my_prod  = sum(p.production for p in mine)
     en_prod  = sum(p.production for p in enemy)
     dom      = (my_ships - en_ships) / max(1, my_ships + en_ships)
-    
-    dying_player, strongest_player = -1, -1
-    kingmaker_protected = set()
-    vulture_targets = []
+    finishing = dom > 0.35 and my_prod > en_prod * 1.3 and step > 100
+    behind   = dom < -0.25
 
-    if is_4p:
-        enemy_stats = {}
-        for p in enemy: enemy_stats[p.owner] = enemy_stats.get(p.owner, 0) + p.ships
-        for f in fleets:
-            if f.owner not in (-1, player):
-                enemy_stats[f.owner] = enemy_stats.get(f.owner, 0) + int(f.ships)
-
-        enemy_planet_owners = set(p.owner for p in enemy)
-        for e_owner, e_ships in enemy_stats.items():
-            if e_owner not in enemy_planet_owners and e_ships > 0:
-                for f in fleets:
-                    if f.owner == e_owner:
-                        tp, t = _fleet_dest(f, planets)
-                        if tp: vulture_targets.append(tp.id)
-
-        sorted_enemies = sorted(enemy_stats.items(), key=lambda x: x[1])
-        if sorted_enemies:
-            strongest_player = sorted_enemies[-1][0]
-            if len(sorted_enemies) >= 2:
-                if sorted_enemies[0][1] < 0.5 * sorted_enemies[1][1]: dying_player = sorted_enemies[0][0]
-                if my_ships > 1.3 * sorted_enemies[-2][1]:
-                    for eo, es in sorted_enemies:
-                        if es < my_ships and eo != sorted_enemies[-2][0] and eo != strongest_player:
-                            kingmaker_protected.add(eo)
-        finishing = dom > 0.25 and my_prod > (en_prod * 0.5) and step > 150
-    else:
-        finishing = dom > 0.35 and my_prod > en_prod * 1.3 and step > 100
-
+    # ── Fleet arrivals ────────────────────────────────────────────────────────
     arr = _build_arrivals(fleets, planets)
-    target_commits = {}
-    planet_dispatched = {}
-    
+
     # ── Defense & availability ────────────────────────────────────────────────
-    reserve, safe_avail, doomed = {}, {}, set()
+    reserve = {}
+    safe_avail = {}
+    doomed = set()
+
     for p in mine:
         need = _defense_needed(p, arr[p.id], player)
         reserve[p.id] = min(p.ships, need)
         safe_avail[p.id] = _safe_ships(p, arr[p.id], player)
+
+        # Check if planet is doomed (will be lost regardless)
         timeline = _simulate_future(p, arr[p.id], player)
-        if any(e[1] != player and e[1] != -1 for e in timeline) and reserve[p.id] >= p.ships:
+        will_be_lost = any(e[1] != player and e[1] != -1 for e in timeline)
+        if will_be_lost and reserve[p.id] >= p.ships:
             doomed.add(p.id)
 
+    # Available ships for offence
     avail = {}
     for p in mine:
-        if p.id in doomed: avail[p.id] = p.ships
-        elif finishing: avail[p.id] = max(0, p.ships - max(0, reserve[p.id] - 5))
-        elif late: avail[p.id] = max(0, p.ships - reserve[p.id])
-        else: avail[p.id] = min(safe_avail[p.id], max(0, p.ships - reserve[p.id]))
+        if p.id in doomed:
+            avail[p.id] = p.ships
+        elif finishing:
+            avail[p.id] = max(0, p.ships - max(0, reserve[p.id] - 5))
+        elif late:
+            avail[p.id] = max(0, p.ships - reserve[p.id])
+        else:
+            avail[p.id] = min(safe_avail[p.id], max(0, p.ships - reserve[p.id]))
 
-    inbound_friendly = {p.id: sum(f.ships for f in fleets if f.owner == player and _fleet_dest(f, planets)[0] == p) for p in planets}
+    # ── In-flight tracking ────────────────────────────────────────────────────
+    inbound_friendly = {}
+    inbound_enemy = {}
+    for f in fleets:
+        p, _ = _fleet_dest(f, planets)
+        if p is None:
+            continue
+        if f.owner == player:
+            inbound_friendly[p.id] = inbound_friendly.get(p.id, 0) + int(f.ships)
+        else:
+            inbound_enemy[p.id] = inbound_enemy.get(p.id, 0) + int(f.ships)
 
-    base_moves = []
-    # ═══ Phase 1: Desperado ═══════════════════════════════════════════════════
+    # ── Dispatch state ────────────────────────────────────────────────────────
+    target_commits = {}  # ships committed to each target this turn
+    planet_dispatched = {}  # ships dispatched from each source
+    moves = []
+
+    # ═══ PHASE 1: Desperado strikes from doomed planets ═══════════════════════
     for sid in list(doomed):
-        if avail[sid] <= 0: continue
+        if avail[sid] <= 0:
+            continue
         src = p_by_id[sid]
         best_tgt, best_score, best_ang = None, -1, None
+
+        # Try attacking enemy planets
         for tgt in tgts:
-            if tgt.owner == -1: continue
+            if tgt.owner == -1:
+                continue
             r = _aim_at(src, tgt, avail[sid], init_map, av, comets, comet_ids)
-            if not r: continue
+            if r is None:
+                continue
             ang, t_a, _, _ = r
-            if t_a > 40 or not _launch_clear(src.x, src.y, ang): continue
+            if t_a > 40 or not _launch_clear(src.x, src.y, ang):
+                continue
             needed = _compute_defender(tgt, t_a, arr[tgt.id], player) + 1
             if avail[sid] >= needed:
                 score = tgt.production / (t_a + 1.0)
-                if score > best_score: best_score, best_tgt, best_ang = score, tgt, ang
+                if score > best_score:
+                    best_score, best_tgt, best_ang = score, tgt, ang
+
+        # Fallback: retreat to nearest safe ally
+        if best_tgt is None:
+            safe_allies = [p for p in mine if p.id not in doomed and p.id != sid]
+            if safe_allies:
+                closest = min(safe_allies, key=lambda p: _dist(src.x, src.y, p.x, p.y))
+                r = _aim_at(src, closest, avail[sid], init_map, av, comets, comet_ids)
+                if r:
+                    ang, t_a, _, _ = r
+                    if _launch_clear(src.x, src.y, ang):
+                        best_tgt, best_ang = closest, ang
+
         if best_tgt and best_ang is not None:
-            base_moves.append([sid, float(best_ang), avail[sid]])
-            if best_tgt.owner != player: target_commits[best_tgt.id] = target_commits.get(best_tgt.id, 0) + avail[sid]
+            moves.append([sid, float(best_ang), avail[sid]])
+            if best_tgt.owner != player:
+                target_commits[best_tgt.id] = target_commits.get(best_tgt.id, 0) + avail[sid]
             planet_dispatched[sid] = avail[sid]
             avail[sid] = 0
 
-    # ═══ Phase 2: Value/Cost Matrix ═══════════════════════════════════════════
+    # ═══ PHASE 2: Value/Cost Matrix — main attack dispatch ════════════════════
     candidates = []
     for src in mine:
-        if avail[src.id] <= 0 or src.id in doomed: continue
+        if avail[src.id] <= 0 or src.id in doomed:
+            continue
+        src_ships = avail[src.id]
+
         for tgt in tgts:
-            if is_4p and tgt.owner in kingmaker_protected: continue
-            dist = _dist(src.x, src.y, tgt.x, tgt.y)
-            if dist > 140: continue
-            est_t = _travel_time(src.x, src.y, tgt.x, tgt.y, max(10, avail[src.id]))
-            if vlate and est_t > rem - 3: continue
-            est_n = _compute_defender(tgt, est_t, arr[tgt.id], player) + 1
-            if est_n > avail[src.id]: continue
-            r = _aim_at(src, tgt, est_n, init_map, av, comets, comet_ids)
-            if not r: continue
+            my_dist = _dist(src.x, src.y, tgt.x, tgt.y)
+            if my_dist > 140:
+                continue
+
+            # Quick estimate
+            est_turns = _travel_time(src.x, src.y, tgt.x, tgt.y, max(10, src_ships))
+            if vlate and est_turns > rem - 3:
+                continue
+            if tgt.id in comet_ids and est_turns >= _comet_ttl(tgt.id, comets):
+                continue
+
+            # Compute defender strength
+            est_needed = _compute_defender(tgt, est_turns, arr[tgt.id], player) + 1
+            if est_needed > src_ships:
+                continue
+
+            # Iterative aiming
+            r = _aim_at(src, tgt, est_needed, init_map, av, comets, comet_ids)
+            if r is None:
+                continue
             ang, turns, _, _ = r
-            if not _launch_clear(src.x, src.y, ang): continue
-            needed = _compute_defender(tgt, turns, arr[tgt.id], player) + 1
-            if needed > avail[src.id]: continue
-            
-            value = (tgt.production * (rem-turns) * CFG["prod_weight"]) + (_indirect_wealth(tgt.id, planets, player) * (rem-turns) * CFG["iw_weight"])
+            if not _launch_clear(src.x, src.y, ang):
+                continue
+
+            ships_needed = _compute_defender(tgt, turns, arr[tgt.id], player) + 1
+            if ships_needed > src_ships:
+                continue
+
+            # Contested neutral check
+            if tgt.owner == -1 and enemy:
+                my_t, en_t = _reaction_time(tgt, mine, enemy)
+                if en_t <= turns:
+                    ships_needed = min(src_ships, int(ships_needed * CFG["contested_margin"]) + 3)
+
+            # ── Value computation ──
+            turns_profit = max(1, rem - turns)
+            if tgt.id in comet_ids:
+                life = _comet_ttl(tgt.id, comets)
+                turns_profit = max(0, min(turns_profit, life - turns))
+                if turns_profit <= 0:
+                    continue
+
+            iw = _indirect_wealth(tgt.id, planets, player)
+            value = (tgt.production * turns_profit * CFG["prod_weight"]) + (iw * turns_profit * CFG["iw_weight"])
+
             if tgt.owner != -1:
+                # Enemy planet: double value (gain + deny)
                 value *= CFG["enemy_multiplier"]
-                if is_4p:
-                    if tgt.owner == dying_player: value *= 0.6
-                    elif tgt.owner == strongest_player: value *= 1.4
+                if finishing:
+                    value *= CFG["finishing_multiplier"]
+                if tgt.ships < 15:
+                    value += 500
             else:
+                # Neutral: contested avoidance
                 if enemy:
-                    min_e = min((_dist(tgt.x, tgt.y, e.x, e.y) for e in enemy), default=200)
-                    if dist > min_e - 2: value *= CFG["contested_neutral_penalty"]
-                    elif early: value *= CFG["early_neutral_multiplier"]
-            
-            score = value / (needed + turns * CFG["cost_turns_weight"] + 1.0)
-            candidates.append((score, src.id, tgt.id, ang, needed, turns))
+                    min_e_dist = min((_dist(tgt.x, tgt.y, e.x, e.y) for e in enemy), default=1e9)
+                    if my_dist > min_e_dist - 2:
+                        value *= CFG["contested_neutral_penalty"]  # Enemy is closer — let them waste ships
+                    elif early:
+                        value *= CFG["early_neutral_multiplier"]   # Safe early grab
+                else:
+                    if early:
+                        value *= CFG["safe_neutral_early_multiplier"]
 
+            cost = ships_needed + turns * CFG["cost_turns_weight"]
+            score = value / (cost + 1.0)
+
+            # Bonuses
+            if early and tgt.owner == -1 and ships_needed <= 18:
+                score *= 1.6
+            if tgt.id in comet_ids and tgt.production >= 1:
+                score *= 1.1
+
+            candidates.append((score, src.id, tgt.id, ang, ships_needed, turns, value))
+
+    # ── Greedy dispatch from sorted matrix ────────────────────────────────────
     candidates.sort(key=lambda x: -x[0])
-    
-    def build_p2(subset):
-        tc, pd, m = target_commits.copy(), planet_dispatched.copy(), []
-        for s, sid, tid, ang, needed, turns in subset:
-            already = tc.get(tid, 0)
-            missing = max(0, needed - inbound_friendly.get(tid, 0) - already)
-            src_val = avail[sid] - pd.get(sid, 0)
-            if missing > 0 and src_val >= missing:
-                m.append([sid, ang, missing])
-                pd[sid] = pd.get(sid, 0) + missing
-                tc[tid] = already + missing
-        return m
 
-    greedy_m = build_p2(candidates)
-    cautious_m = build_p2(candidates[:5])
-    
-    # Evaluate candidates
-    full_sets = [base_moves + greedy_m, base_moves + cautious_m]
-    best_final = select_best_move_set(full_sets, sim_state, player, CFG)
-    
-    return best_final
+    for score, sid, tid, ang, ships_needed, turns, value in candidates:
+        already = target_commits.get(tid, 0)
+        tgt = p_by_id[tid]
+        base_needed = _compute_defender(tgt, turns, arr[tgt.id], player) + 1
+        missing = max(0, base_needed - inbound_friendly.get(tid, 0) - already)
+        if missing <= 0:
+            continue
+
+        src_avail = avail[sid] - planet_dispatched.get(sid, 0)
+        if src_avail <= 0:
+            continue
+
+        send = min(src_avail, missing)
+        if send < 1:
+            continue
+
+        moves.append([sid, float(ang), int(send)])
+        planet_dispatched[sid] = planet_dispatched.get(sid, 0) + send
+        target_commits[tid] = already + send
+
+    # Update avail
+    for sid in planet_dispatched:
+        avail[sid] = max(0, avail[sid] - planet_dispatched.get(sid, 0))
+
+    # ═══ PHASE 3: Supplement attacks (cooperative gap-filling) ═════════════════
+    if not vlate:
+        for src in mine:
+            if avail[src.id] < 8 or src.id in doomed:
+                continue
+            src_ships = avail[src.id]
+            best = None
+            for tgt in tgts:
+                d0 = _dist(src.x, src.y, tgt.x, tgt.y)
+                if d0 > 140:
+                    continue
+                est_turns = _travel_time(src.x, src.y, tgt.x, tgt.y, max(10, src_ships))
+                if late and est_turns > rem - 5:
+                    continue
+                if tgt.id in comet_ids and est_turns >= _comet_ttl(tgt.id, comets):
+                    continue
+                defender = _compute_defender(tgt, est_turns, arr[tgt.id], player)
+                committed = target_commits.get(tgt.id, 0) + inbound_friendly.get(tgt.id, 0)
+                missing = max(0, defender + 1 - committed)
+                if missing <= 0:
+                    continue
+                if missing > src_ships and committed == 0:
+                    continue
+                send = min(src_ships, missing)
+                if send < 5:
+                    continue
+                if committed + send < defender + 1:
+                    continue
+                turns_profit = max(1, rem - est_turns)
+                v = tgt.production * turns_profit
+                if tgt.owner != -1:
+                    v *= 2.0
+                score_s = v / (send + est_turns * 0.5 + 1.0)
+                if best is None or score_s > best[0]:
+                    best = (score_s, tgt, send, est_turns)
+
+            if best is None:
+                continue
+            _, tgt, send, est_turns = best
+            r = _aim_at(src, tgt, send, init_map, av, comets, comet_ids)
+            if r is None:
+                continue
+            ang, turns, _, _ = r
+            if not _launch_clear(src.x, src.y, ang):
+                continue
+            moves.append([src.id, float(ang), int(send)])
+            avail[src.id] -= send
+            target_commits[tgt.id] = target_commits.get(tgt.id, 0) + send
+
+    # ═══ PHASE 4: Forward funnel (rear → front logistics) ═════════════════════
+    if not vlate and len(mine) > 1 and (enemy or neutral):
+        ref_set = enemy if enemy else neutral
+        front_dist = {p.id: min((_dist(p.x, p.y, e.x, e.y) for e in ref_set), default=200)
+                      for p in mine}
+        front = min(mine, key=lambda p: front_dist[p.id])
+
+        # Score each friendly planet by proximity to enemy production
+        front_scores = {}
+        if enemy:
+            front_scores = {p.id: sum(e.production / (_dist(p.x, p.y, e.x, e.y) + 1.0) for e in enemy)
+                            for p in mine}
+            best_front = max(mine, key=lambda p: front_scores.get(p.id, 0))
+        else:
+            best_front = front
+
+        send_ratio = CFG["funnel_finishing_ratio"] if finishing else CFG["funnel_ratio"]
+
+        for r in sorted(mine, key=lambda p: -front_dist.get(p.id, 0)):
+            if r.id == best_front.id or r.id in doomed:
+                continue
+            if front_dist.get(r.id, 0) < front_dist.get(best_front.id, 0) * 1.2:
+                continue
+            if avail[r.id] < 15:
+                continue
+
+            # Find forward target (closer ally)
+            mid = [p for p in mine if p.id != r.id and p.id not in doomed
+                   and front_dist.get(p.id, 1e9) < front_dist.get(r.id, 0) * 0.75]
+            if mid:
+                mid.sort(key=lambda p: _dist(r.x, r.y, p.x, p.y))
+                fwd_tgt = mid[0]
+            else:
+                fwd_tgt = best_front
+            if fwd_tgt.id == r.id:
+                continue
+
+            send = int(avail[r.id] * send_ratio)
+            if send < 10:
+                continue
+
+            ra = _aim_at(r, fwd_tgt, send, init_map, av, comets, comet_ids)
+            if ra is None:
+                continue
+            ang, turns, _, _ = ra
+            if turns > 40 or not _launch_clear(r.x, r.y, ang):
+                continue
+            moves.append([r.id, float(ang), int(send)])
+            avail[r.id] -= send
+
+    # ═══ PHASE 5: Finishing cleanup ═══════════════════════════════════════════
+    if finishing and enemy:
+        weak = sorted(enemy, key=lambda p: p.ships + p.production * 10)
+        for src in mine:
+            if avail[src.id] < 25:
+                continue
+            for tgt in weak[:3]:
+                if target_commits.get(tgt.id, 0) + inbound_friendly.get(tgt.id, 0) > tgt.ships + tgt.production * 5:
+                    continue
+                d0 = _dist(src.x, src.y, tgt.x, tgt.y)
+                if d0 > 120:
+                    continue
+                turns_est = _travel_time(src.x, src.y, tgt.x, tgt.y, avail[src.id])
+                if turns_est > rem - 5:
+                    continue
+                needed = _compute_defender(tgt, turns_est, arr[tgt.id], player) + 1
+                committed = target_commits.get(tgt.id, 0) + inbound_friendly.get(tgt.id, 0)
+                missing = max(0, needed - committed)
+                if missing <= 0:
+                    continue
+                send = min(avail[src.id], missing + 5)
+                if send < 10:
+                    continue
+                ra = _aim_at(src, tgt, send, init_map, av, comets, comet_ids)
+                if ra is None:
+                    continue
+                ang, turns, _, _ = ra
+                if not _launch_clear(src.x, src.y, ang):
+                    continue
+                moves.append([src.id, float(ang), int(send)])
+                avail[src.id] -= send
+                target_commits[tgt.id] = target_commits.get(tgt.id, 0) + send
+                break
+
+    # ═══ FINAL: Deduplicate & validate ════════════════════════════════════════
+    dedup = {}
+    for sid, ang, sh in moves:
+        key = (sid, round(ang, 4))
+        if key in dedup:
+            dedup[key] = (sid, ang, dedup[key][2] + sh)
+        else:
+            dedup[key] = (sid, ang, sh)
+
+    used = {}
+    final = []
+    for sid, ang, sh in dedup.values():
+        src = p_by_id.get(sid)
+        if src is None:
+            continue
+        mx = src.ships - used.get(sid, 0)
+        send = min(sh, mx)
+        if send >= 1:
+            final.append([sid, float(ang), int(send)])
+            used[sid] = used.get(sid, 0) + send
+
+    return final
