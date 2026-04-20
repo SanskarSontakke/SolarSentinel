@@ -342,7 +342,7 @@ def run_arena(args):
 
 # ── Parameter space with bounds ───────────────────────────────────────────────
 PARAM_SPACE = {
-    "enemy_multiplier":              (1.2, 3.5),
+    "enemy_multiplier":              (0.8, 3.5),
     "finishing_multiplier":          (1.0, 3.0),
     "early_neutral_multiplier":      (1.0, 3.0),
     "safe_neutral_early_multiplier": (0.8, 2.5),
@@ -497,6 +497,20 @@ def run_evolution(args):
     stagnation_counter = 0
     n_workers = max(1, multiprocessing.cpu_count() - 1)
     t0 = time.time()
+    require_improvement = True
+
+    # ─── Measure initial score vs baseline ────────────────────────────────────
+    print(f"\n  Measuring current agent performance vs v0 baseline...")
+    # Run 5 quick games as requested
+    initial_jobs = [(str(SUBMISSION_FILE), str(opp_path), g, 0) for g in range(5)]
+    with multiprocessing.Pool(n_workers) as pool:
+        initial_res = pool.map(_eval_worker, initial_jobs)
+    
+    initial_wr = sum(r[0] for r in initial_res) / len(initial_res)
+    initial_lead = sum(r[1] for r in initial_res) / len(initial_res)
+    initial_score = initial_wr * 150 + initial_lead / 30.0
+    print(f"  [GUARD] Current agent score: {initial_score:.1f} (WR: {initial_wr*100:.1f}%)")
+    print("-" * 70)
 
     for gen in range(1, args.generations + 1):
         gen_t0 = time.time()
@@ -585,7 +599,9 @@ def run_evolution(args):
         if stagnation_counter == 3:
             sigma = min(sigma * 2.0, args.sigma)
             stagnation_counter = 0
+            parent_vecs = [best_vec.copy(), best_vec.copy()]
             print(f"    [RESET] Stagnation detected. Boosting sigma to {sigma:.4f}")
+            print(f"    [RESET] Also restored parents to global best.")
 
         # Decay sigma
         sigma *= args.sigma_decay
@@ -637,8 +653,11 @@ def run_evolution(args):
         print(f"    {k:>35s}  {v:8.4f}  [{lo:5.2f} {bar} {hi:5.2f}]")
 
     # ── Inject into submission.py ─────────────────────────────────────────
-    print(f"\n  Injecting best CFG into submission.py...")
-    inject_cfg_into_submission(best_cfg)
+    if best_score > initial_score or not require_improvement:
+        print(f"\n  Injecting best CFG into submission.py...")
+        inject_cfg_into_submission(best_cfg)
+    else:
+        print(f"\n  [SKIP] Best evolved score ({best_score:.1f}) did not beat initial score ({initial_score:.1f}). Skipping injection.")
 
     # ── Verification benchmark ────────────────────────────────────────────
     print(f"\n  Running verification benchmark...")

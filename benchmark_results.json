@@ -1,109 +1,217 @@
 {
-  "timestamp": "2026-04-18T12:18:52.504041+00:00",
-  "agent_a": "submission.py",
-  "agent_b": "snapshots/agent_v0.py",
-  "mode": "2p",
-  "total_games": 10,
-  "wins_a": 6,
-  "wins_b": 4,
-  "draws": 0,
-  "winrate_a": 0.5722,
-  "winrate_a_ci": [
-    0.3127,
-    0.8318
+  "timestamp": "2026-04-20T13:28:43.929387+00:00",
+  "mode": "1v3",
+  "games": 12,
+  "wins": [
+    0,
+    6,
+    5,
+    1
   ],
-  "winrate_b": 0.4278,
-  "winrate_b_ci": [
-    0.1682,
-    0.6873
-  ],
-  "avg_ship_lead": 5922.6,
-  "avg_game_length": 267.7,
-  "chi2": 0.0,
-  "p_value": 1.0,
-  "significant": false,
-  "verdict": "QUICK MODE \u2014 no statistical verdict",
-  "elapsed_seconds": 53.5,
-  "per_game_results": [
+  "results": [
     {
-      "outcome": "A",
-      "ships_a": 42395,
-      "ships_b": 164,
-      "ship_lead": 42231,
-      "game_length": 499,
-      "a_slot": 0
+      "game_idx": 0,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        0,
+        3354,
+        0,
+        0
+      ],
+      "winner": 1,
+      "steps": 428
     },
     {
-      "outcome": "B",
-      "ships_a": 0,
-      "ships_b": 842,
-      "ship_lead": -842,
-      "game_length": 177,
-      "a_slot": 1
+      "game_idx": 1,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        0,
+        3091,
+        0,
+        0
+      ],
+      "winner": 1,
+      "steps": 209
     },
     {
-      "outcome": "A",
-      "ships_a": 4617,
-      "ships_b": 0,
-      "ship_lead": 4617,
-      "game_length": 499,
-      "a_slot": 0
+      "game_idx": 2,
+      "rewards": [
+        -1,
+        -1,
+        1,
+        -1
+      ],
+      "ships": [
+        2002,
+        6678,
+        15707,
+        5084
+      ],
+      "winner": 2,
+      "steps": 499
     },
     {
-      "outcome": "A",
-      "ships_a": 1989,
-      "ships_b": 0,
-      "ship_lead": 1989,
-      "game_length": 132,
-      "a_slot": 1
+      "game_idx": 3,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        0,
+        3105,
+        0,
+        0
+      ],
+      "winner": 1,
+      "steps": 196
     },
     {
-      "outcome": "A",
-      "ships_a": 6186,
-      "ships_b": 0,
-      "ship_lead": 6186,
-      "game_length": 268,
-      "a_slot": 0
+      "game_idx": 4,
+      "rewards": [
+        -1,
+        -1,
+        1,
+        -1
+      ],
+      "ships": [
+        0,
+        0,
+        3189,
+        0
+      ],
+      "winner": 2,
+      "steps": 293
     },
     {
-      "outcome": "A",
-      "ships_a": 6285,
-      "ships_b": 0,
-      "ship_lead": 6285,
-      "game_length": 202,
-      "a_slot": 1
+      "game_idx": 5,
+      "rewards": [
+        -1,
+        -1,
+        1,
+        -1
+      ],
+      "ships": [
+        508,
+        12896,
+        16081,
+        7258
+      ],
+      "winner": 2,
+      "steps": 499
     },
     {
-      "outcome": "B",
-      "ships_a": 0,
-      "ships_b": 2897,
-      "ship_lead": -2897,
-      "game_length": 204,
-      "a_slot": 0
+      "game_idx": 6,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        2002,
+        9906,
+        3696,
+        2147
+      ],
+      "winner": 1,
+      "steps": 499
     },
     {
-      "outcome": "B",
-      "ships_a": 0,
-      "ships_b": 849,
-      "ship_lead": -849,
-      "game_length": 267,
-      "a_slot": 1
+      "game_idx": 7,
+      "rewards": [
+        -1,
+        -1,
+        1,
+        -1
+      ],
+      "ships": [
+        1704,
+        0,
+        7075,
+        611
+      ],
+      "winner": 2,
+      "steps": 499
     },
     {
-      "outcome": "A",
-      "ships_a": 5940,
-      "ships_b": 0,
-      "ship_lead": 5940,
-      "game_length": 222,
-      "a_slot": 0
+      "game_idx": 8,
+      "rewards": [
+        -1,
+        -1,
+        -1,
+        1
+      ],
+      "ships": [
+        0,
+        0,
+        0,
+        4904
+      ],
+      "winner": 3,
+      "steps": 183
     },
     {
-      "outcome": "B",
-      "ships_a": 0,
-      "ships_b": 3434,
-      "ship_lead": -3434,
-      "game_length": 207,
-      "a_slot": 1
+      "game_idx": 9,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        508,
+        8864,
+        4909,
+        4157
+      ],
+      "winner": 1,
+      "steps": 499
+    },
+    {
+      "game_idx": 10,
+      "rewards": [
+        -1,
+        -1,
+        1,
+        -1
+      ],
+      "ships": [
+        1482,
+        5012,
+        8872,
+        4950
+      ],
+      "winner": 2,
+      "steps": 499
+    },
+    {
+      "game_idx": 11,
+      "rewards": [
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "ships": [
+        2500,
+        10934,
+        5074,
+        7231
+      ],
+      "winner": 1,
+      "steps": 499
     }
   ]
 }

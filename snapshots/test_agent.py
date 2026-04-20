@@ -25,7 +25,7 @@ OPENING_TURN_LIMIT = 80
 LATE_REMAINING_TURNS = 60
 VERY_LATE_REMAINING_TURNS = 25
 
-SAFE_NEUTRAL_MARGIN = 1
+SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 2
 INTERCEPT_TOLERANCE = 1
 
@@ -161,7 +161,7 @@ FINISHING_ATTACK_MARGIN_BONUS = 0.08
 DOOMED_EVAC_TURN_LIMIT = 24
 DOOMED_MIN_SHIPS = 8
 
-SOFT_ACT_DEADLINE = 0.85
+SOFT_ACT_DEADLINE = 0.82
 HEAVY_PHASE_MIN_TIME = 0.16
 OPTIONAL_PHASE_MIN_TIME = 0.08
 HEAVY_ROUTE_PLANET_LIMIT = 32
@@ -413,24 +413,64 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
     return best
 
 
-    # v22.0 THE SINGULARITY OVERLORD: Tightened Convergence
-    tx, ty = target.x, target.y
-    iters = 10 if high_precision else 1
-    for _ in range(iters):
-        est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-        if est is None: break
-        angle, turns = est
-        pos = predict_target_position(target, turns, initial_by_id, ang_vel, comets, comet_ids)
-        if pos and abs(tx - pos[0]) < 0.1 and abs(ty - pos[1]) < 0.1:
-            return angle, turns, pos[0], pos[1]
-        if not pos: break
-        tx, ty = pos[0], pos[1]
-    
-    if not high_precision:
-        est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-        if est: return est[0], est[1], tx, ty
+def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
+    # Iterate toward a self-consistent moving-target intercept, then fall back
+    # to a later safe window if needed.
+    est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
+    if est is None:
+        if not target_can_move(target, initial_by_id, comet_ids):
+            return None
+        return search_safe_intercept(
+            src,
+            target,
+            ships,
+            initial_by_id,
+            ang_vel,
+            comets,
+            comet_ids,
+        )
 
-    return search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids)
+    tx, ty = target.x, target.y
+    for _ in range(5):
+        _, turns = est
+        pos = predict_target_position(target, turns, initial_by_id, ang_vel, comets, comet_ids)
+        if pos is None:
+            return None
+        ntx, nty = pos
+        next_est = estimate_arrival(src.x, src.y, src.radius, ntx, nty, target.radius, ships)
+        if next_est is None:
+            if not target_can_move(target, initial_by_id, comet_ids):
+                return None
+            return search_safe_intercept(
+                src,
+                target,
+                ships,
+                initial_by_id,
+                ang_vel,
+                comets,
+                comet_ids,
+            )
+        if (
+            abs(ntx - tx) < 0.3
+            and abs(nty - ty) < 0.3
+            and abs(next_est[1] - turns) <= INTERCEPT_TOLERANCE
+        ):
+            return next_est[0], next_est[1], ntx, nty
+        tx, ty = ntx, nty
+        est = next_est
+
+    final_est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
+    if final_est is None:
+        return search_safe_intercept(
+            src,
+            target,
+            ships,
+            initial_by_id,
+            ang_vel,
+            comets,
+            comet_ids,
+        )
+    return final_est[0], final_est[1], tx, ty
 # ============================================================
 # World Model
 # ============================================================
@@ -565,32 +605,30 @@ def simulate_planet_timeline(planet, arrivals, player, horizon):
     holds_full = True
 
     if planet.owner == player:
-        # v23.0: High-Speed Linear Safety Watermark (Replaces slow binary search)
-        # We calculate the minimum ships needed AT START to keep garrison >= 0 at every event.
-        running_potential = 0.0
-        max_deficit = 0.0
-        
-        # We need a secondary simulation to find the exact keep_needed without 
-        # repeating the production logic inside a loop.
-        sim_owner = planet.owner
-        sim_ships = 0.0 # Start with 0 ships to see the cumulative deficit
-        for turn in range(1, horizon + 1):
-            if sim_owner != -1:
-                sim_ships += planet.production
-            group = by_turn.get(turn, [])
-            if group:
-                sim_owner, sim_ships = resolve_arrival_event(sim_owner, sim_ships, group)
-                if sim_owner != player:
-                    # If we lost the planet without ANY starting ships, we track 
-                    # how many ships we WOULD have needed as a 'debt'.
-                    # Or simpler: if it's lost, it's lost.
-                    pass
-            max_deficit = max(max_deficit, -sim_ships)
-        
-        # The 'keep_needed' is the deficit we must fill.
-        keep_needed = int(math.ceil(max_deficit))
-        
-        if keep_needed > planet.ships:
+
+        def survives_with_keep(keep):
+            sim_owner = planet.owner
+            sim_garrison = float(keep)
+            for turn in range(1, horizon + 1):
+                if sim_owner != -1:
+                    sim_garrison += planet.production
+                group = by_turn.get(turn, [])
+                if group:
+                    sim_owner, sim_garrison = resolve_arrival_event(sim_owner, sim_garrison, group)
+                    if sim_owner != player:
+                        return False
+            return sim_owner == player
+
+        if survives_with_keep(int(planet.ships)):
+            lo, hi = 0, int(planet.ships)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if survives_with_keep(mid):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            keep_needed = lo
+        else:
             holds_full = False
             keep_needed = int(planet.ships)
 
@@ -749,12 +787,12 @@ class WorldModel:
     def source_inventory_left(self, source_id, spent_total):
         return max(0, int(self.planet_by_id[source_id].ships) - spent_total[source_id])
 
-    def plan_shot(self, src_id, target_id, ships, high_precision=True):
+    def plan_shot(self, src_id, target_id, ships):
         ships = int(ships)
-        key = (src_id, target_id, ships, high_precision)
+        key = (src_id, target_id, ships)
+        cached = self.shot_cache.get(key)
         if key in self.shot_cache:
-            return self.shot_cache[key]
-        
+            return cached
         src = self.planet_by_id[src_id]
         target = self.planet_by_id[target_id]
         result = aim_with_prediction(
@@ -765,7 +803,6 @@ class WorldModel:
             self.ang_vel,
             self.comets,
             self.comet_ids,
-            high_precision=high_precision
         )
         self.shot_cache[key] = result
         return result
@@ -845,8 +882,7 @@ class WorldModel:
         best_key = None
 
         for ships in self.probe_ship_candidates(src_id, target_id, source_cap, hints=hints):
-            # v21.0: Probe phase uses low-precision for massive speed gain
-            aim = self.plan_shot(src_id, target_id, ships, high_precision=False)
+            aim = self.plan_shot(src_id, target_id, ships)
             if aim is None:
                 continue
 
@@ -1281,7 +1317,7 @@ def build_policy_state(world, deadline=None):
 
         proactive_keep = 0
         for enemy in nearest_sources_to_target(planet, world.enemy_planets, PROACTIVE_ENEMY_TOP_K):
-            enemy_aim = world.plan_shot(enemy.id, planet.id, max(1, int(enemy.ships)), high_precision=False)
+            enemy_aim = world.plan_shot(enemy.id, planet.id, max(1, int(enemy.ships)))
             if enemy_aim is None:
                 continue
             enemy_eta = enemy_aim[1]
@@ -1450,12 +1486,7 @@ def reinforce_value(target, hold_until, world, policy):
 
 
 def preferred_send(target, base_needed, arrival_turns, src_available, world, modes, policy):
-    # v24.0: Vanguard Over-send (8% margin to win distance ties)
-    multiplier = modes["attack_margin_mult"]
-    if target.owner == -1 and world.is_early:
-        multiplier = max(multiplier, 1.08)
-    
-    send = max(base_needed, int(math.ceil(base_needed * multiplier)))
+    send = max(base_needed, int(math.ceil(base_needed * modes["attack_margin_mult"])))
     margin = 0
     if target.owner == -1:
         margin += min(
@@ -2281,11 +2312,6 @@ def plan_moves(world, deadline=None):
                 return finalize_moves()
             if target.id == src.id or target.owner == world.player:
                 continue
-            
-            # v21.0: Optimized Pruning (Match Elite search breadth but safe for CPU)
-            if dist(src.x, src.y, target.x, target.y) > 55.0:
-                continue
-            
 
             seeded = world.best_probe_aim(
                 src.id,
