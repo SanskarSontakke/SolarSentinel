@@ -114,7 +114,7 @@ RECAPTURE_FRONTIER_MULT = 1.08
 RECAPTURE_PRODUCTION_WEIGHT = 0.6
 RECAPTURE_IMMEDIATE_WEIGHT = 0.4
 
-REAR_SOURCE_MIN_SHIPS = 16
+REAR_SOURCE_MIN_SHIPS = 10
 REAR_DISTANCE_RATIO = 1.25
 REAR_STAGE_PROGRESS = 0.78
 REAR_SEND_RATIO_TWO_PLAYER = 0.62
@@ -413,22 +413,47 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
     return best
 
 
-    # v22.0 THE SINGULARITY OVERLORD: Tightened Convergence
+def aim_with_prediction(src, target, ships, initial_by_id, ang_vel,
+                        comets, comet_ids, high_precision=True):
+    """Iterative intercept with lead aiming. Returns (angle, turns, tx, ty) or None."""
     tx, ty = target.x, target.y
-    iters = 10 if high_precision else 1
+    iters = 8 if high_precision else 2
+
+    est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
+    if est is None:
+        # If direct shot is not possible, and target can't move, it's impossible.
+        # Otherwise, search for a safe intercept window.
+        if not target_can_move(target, initial_by_id, comet_ids):
+            return None
+        return search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids)
+
     for _ in range(iters):
-        est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-        if est is None: break
         angle, turns = est
         pos = predict_target_position(target, turns, initial_by_id, ang_vel, comets, comet_ids)
-        if pos and abs(tx - pos[0]) < 0.1 and abs(ty - pos[1]) < 0.1:
-            return angle, turns, pos[0], pos[1]
-        if not pos: break
-        tx, ty = pos[0], pos[1]
-    
-    if not high_precision:
-        est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-        if est: return est[0], est[1], tx, ty
+        if pos is None:
+            # Target might have expired (e.g. comet)
+            break
+        ntx, nty = pos
+
+        next_est = estimate_arrival(src.x, src.y, src.radius, ntx, nty, target.radius, ships)
+        if next_est is None:
+            # The new predicted position is unreachable, fall back to search
+            if not target_can_move(target, initial_by_id, comet_ids):
+                return None
+            return search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids)
+
+        # Convergence check: position and time must both be stable
+        if (abs(ntx - tx) < 0.3 and abs(nty - ty) < 0.3 and
+            abs(next_est[1] - turns) <= INTERCEPT_TOLERANCE):
+            return next_est[0], next_est[1], ntx, nty
+
+        tx, ty = ntx, nty
+        est = next_est
+
+    # After iterations, if not converged, try one last time with the final position.
+    final_est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
+    if final_est:
+        return final_est[0], final_est[1], tx, ty
 
     return search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids)
 # ============================================================
@@ -565,32 +590,35 @@ def simulate_planet_timeline(planet, arrivals, player, horizon):
     holds_full = True
 
     if planet.owner == player:
-        # v23.0: High-Speed Linear Safety Watermark (Replaces slow binary search)
-        # We calculate the minimum ships needed AT START to keep garrison >= 0 at every event.
-        running_potential = 0.0
-        max_deficit = 0.0
+        def survives_with_keep(keep):
+            sim_owner = planet.owner
+            sim_garrison = float(keep)
+            for turn in range(1, horizon + 1):
+                if sim_owner != -1:
+                    sim_garrison += planet.production
+                group = by_turn.get(turn, [])
+                if group:
+                    sim_owner, sim_garrison = resolve_arrival_event(
+                        sim_owner, sim_garrison, group
+                    )
+                    if sim_owner != player:
+                        return False
+            return sim_owner == player
+
+        if not survives_with_keep(int(planet.ships)):
+            holds_full = False
+            keep_needed = int(planet.ships)
+        else:
+            lo, hi = 0, int(planet.ships)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if survives_with_keep(mid):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            keep_needed = lo
         
-        # We need a secondary simulation to find the exact keep_needed without 
-        # repeating the production logic inside a loop.
-        sim_owner = planet.owner
-        sim_ships = 0.0 # Start with 0 ships to see the cumulative deficit
-        for turn in range(1, horizon + 1):
-            if sim_owner != -1:
-                sim_ships += planet.production
-            group = by_turn.get(turn, [])
-            if group:
-                sim_owner, sim_ships = resolve_arrival_event(sim_owner, sim_ships, group)
-                if sim_owner != player:
-                    # If we lost the planet without ANY starting ships, we track 
-                    # how many ships we WOULD have needed as a 'debt'.
-                    # Or simpler: if it's lost, it's lost.
-                    pass
-            max_deficit = max(max_deficit, -sim_ships)
-        
-        # The 'keep_needed' is the deficit we must fill.
-        keep_needed = int(math.ceil(max_deficit))
-        
-        if keep_needed > planet.ships:
+        if keep_needed > int(planet.ships):
             holds_full = False
             keep_needed = int(planet.ships)
 
@@ -1294,7 +1322,11 @@ def build_policy_state(world, deadline=None):
         proactive_keep = max(proactive_keep, stacked_enemy_proactive_keep(planet, world))
 
         reserve[planet.id] = min(int(planet.ships), max(exact_keep, proactive_keep))
-        attack_budget[planet.id] = max(0, int(planet.ships) - reserve[planet.id])
+        
+        if not world.base_timeline[planet.id]["holds_full"]:
+            attack_budget[planet.id] = 0  # Doomed: no offensive budget
+        else:
+            attack_budget[planet.id] = max(0, int(planet.ships) - reserve[planet.id])
 
     return {
         "indirect_wealth_map": indirect_wealth_map,
@@ -1312,9 +1344,13 @@ def build_modes(world):
         world.max_enemy_strength > 0 and world.my_total > world.max_enemy_strength * 1.25
     )
     is_finishing = (
-        domination > FINISHING_DOMINATION
-        and world.my_prod > world.enemy_prod * FINISHING_PROD_RATIO
-        and world.step > 100
+        (domination > FINISHING_DOMINATION
+         and world.my_prod > world.enemy_prod * FINISHING_PROD_RATIO
+         and world.step > 100)
+        or
+        # Anti-stall: if winning for a long time with more planets, go all-in
+        (domination > 0.20 and world.step > 200 
+         and world.my_prod >= world.enemy_prod * 1.1)
     )
 
     attack_margin_mult = 1.0
@@ -1325,6 +1361,19 @@ def build_modes(world):
     if is_finishing:
         attack_margin_mult += FINISHING_ATTACK_MARGIN_BONUS
 
+    # v25.2: Inverted Coalition-Aware Scaling (Aggressive Dominance)
+    # Testing showed 'Stealth Mode' led to decline. We now trigger 'Crush Mode' when ahead.
+    coalition_aggression_mult = 1.0
+    if world.is_four_player and not is_finishing:
+        enemy_prods = [world.owner_production.get(o, 0) for o in world.owner_production if o != world.player]
+        avg_enemy_prod = sum(enemy_prods) / max(1, len(enemy_prods))
+        prod_ratio = world.my_prod / max(1, avg_enemy_prod)
+        
+        if prod_ratio > 1.25:
+            coalition_aggression_mult = 1.15  # Crush Mode (Inverted from 0.92)
+        elif prod_ratio < 0.75:
+            coalition_aggression_mult = 1.25  # Scavenger Mode (Inverted from 1.12)
+
     return {
         "domination": domination,
         "is_behind": is_behind,
@@ -1332,6 +1381,7 @@ def build_modes(world):
         "is_dominating": is_dominating,
         "is_finishing": is_finishing,
         "attack_margin_mult": attack_margin_mult,
+        "coalition_aggression_mult": coalition_aggression_mult,
     }
 
 
@@ -1367,6 +1417,11 @@ def opening_filter(target, arrival_turns, needed, src_available, world, policy):
         return False
 
     if world.is_four_player:
+        # v25.2: Removed restrictive Sector Locking. 
+        # Instead, we just prioritize high producers.
+        if target.production >= 4:
+            return False
+
         affordable = needed <= max(
             PARTIAL_SOURCE_MIN_SHIPS,
             int(src_available * FOUR_PLAYER_ROTATING_SEND_RATIO),
@@ -1377,8 +1432,16 @@ def opening_filter(target, arrival_turns, needed, src_available, world, policy):
             and reaction_gap >= FOUR_PLAYER_ROTATING_REACTION_GAP
         ):
             return False
-        return True
+        
+        # v25.2: Center Access (Only skip if far AND low production)
+        dist_to_center = dist(target.x, target.y, CENTER_X, CENTER_Y)
+        if dist_to_center > 45.0 and target.production <= 2:
+            return True
+        
+        return False # Try everything else
 
+    if target.production >= 3 and arrival_turns <= 18:
+        return False  # Always try to grab prod-3+ planets early
     return arrival_turns > ROTATING_OPENING_MAX_TURNS or target.production <= ROTATING_OPENING_LOW_PROD
 
 
@@ -1393,6 +1456,29 @@ def target_value(target, arrival_turns, mission, world, modes, policy):
     value = target.production * turns_profit
     value += policy["indirect_wealth_map"][target.id] * turns_profit * INDIRECT_VALUE_SCALE
 
+    # v25.2: Center-Focus Bonus (Early map control)
+    if world.step < 150:
+        dist_to_center = dist(target.x, target.y, CENTER_X, CENTER_Y)
+        if dist_to_center < 15.0:
+            value *= 1.35
+        elif dist_to_center < 30.0:
+            value *= 1.18
+
+    # v25.2: Vulture Heuristic
+    # If multiple enemies are conflicting on a neutral/hostile target, it's a prime exploit.
+    enemy_arrivals = [a for a in world.arrivals_by_planet[target.id] if a[1] not in (-1, world.player)]
+    if len(enemy_arrivals) >= 2:
+        distinct_owners = len(set(a[1] for a in enemy_arrivals))
+        if distinct_owners >= 2:
+            staggered = (max(a[0] for a in enemy_arrivals) - min(a[0] for a in enemy_arrivals)) > 2
+            if staggered:
+                value *= 1.45  # Massive bonus for harvesting a crossfire
+            else:
+                value *= 1.15  # General conflict bonus
+
+    # v25.2: Apply Inverted Coalition-Aware Scaling (Aggressive Dominance)
+    value *= modes.get("coalition_aggression_mult", 1.0)
+
     if world.is_static(target.id):
         value *= STATIC_NEUTRAL_VALUE_MULT if target.owner == -1 else STATIC_HOSTILE_VALUE_MULT
     else:
@@ -1400,6 +1486,14 @@ def target_value(target, arrival_turns, mission, world, modes, policy):
 
     if target.owner not in (-1, world.player):
         value *= OPENING_HOSTILE_TARGET_VALUE_MULT if world.is_opening else HOSTILE_TARGET_VALUE_MULT
+        # v24.2: Elimination bonus (enemy nearly gone)
+        enemy_planet_count = sum(
+            1 for p in world.planets if p.owner == target.owner
+        )
+        if enemy_planet_count <= 2:
+            value += 20.0 * target.production   # Finish them
+        if enemy_planet_count == 1:
+            value += 40.0 * target.production   # Kill shot
 
     if target.owner == -1:
         if is_safe_neutral(target, policy):
@@ -1408,6 +1502,10 @@ def target_value(target, arrival_turns, mission, world, modes, policy):
             value *= CONTESTED_NEUTRAL_VALUE_MULT
         if world.is_early:
             value *= EARLY_NEUTRAL_VALUE_MULT
+            if target.production >= 4:
+                value *= 1.35   # Extra bonus for high-prod early grabs
+            elif target.production >= 3:
+                value *= 1.18
 
     if target.id in world.comet_ids:
         value *= COMET_VALUE_MULT
@@ -2221,7 +2319,13 @@ def plan_moves(world, deadline=None):
     def finalize_moves():
         final_moves = []
         used_final = defaultdict(int)
+        
+        # Aggregate moves by (src_id, angle) to prevent staggered split-fleet launches
+        aggregated = defaultdict(int)
         for src_id, angle, ships in moves:
+            aggregated[(src_id, round(angle, 5))] += ships
+            
+        for (src_id, angle), ships in aggregated.items():
             source = world.planet_by_id[src_id]
             max_allowed = int(source.ships) - used_final[src_id]
             send = min(int(ships), max_allowed)
@@ -2282,8 +2386,9 @@ def plan_moves(world, deadline=None):
             if target.id == src.id or target.owner == world.player:
                 continue
             
-            # v21.0: Optimized Pruning (Match Elite search breadth but safe for CPU)
-            if dist(src.x, src.y, target.x, target.y) > 55.0:
+            # v24.1: Dynamic Pruning (Allows cross-map captures if time permits)
+            rough_eta = int(dist(src.x, src.y, target.x, target.y) / MAX_SPEED) + 2
+            if rough_eta > world.remaining_steps - (VERY_LATE_CAPTURE_BUFFER if world.is_very_late else LATE_CAPTURE_BUFFER):
                 continue
             
 
@@ -2639,13 +2744,14 @@ def plan_moves(world, deadline=None):
                 continue
 
             angle, turns, _, need, send = plan
-            if send < need or need > left:
+            
+            # Pre-verify before mutating state via append_move
+            if send < need or need > left or source_inventory_left(option.src_id) < need:
                 continue
 
             sent = append_move(option.src_id, angle, send)
-            if sent < need:
-                continue
-            planned_commitments[target.id].append((turns, world.player, int(sent)))
+            if sent > 0:
+                planned_commitments[target.id].append((turns, world.player, int(sent)))
             continue
 
         limits = []
@@ -2709,15 +2815,25 @@ def plan_moves(world, deadline=None):
         if owner_after != world.player:
             continue
 
-        committed = []
+        # Pre-check actual availability to prevent suicidal partial-swarm state leaks
+        actual_sends = []
+        total_possible = 0
         for src_id, angle, turns, send in reaimed:
-            actual = append_move(src_id, angle, send)
-            if actual <= 0:
-                continue
-            committed.append((turns, world.player, int(actual)))
-        if sum(item[2] for item in committed) < missing:
+            possible = min(int(send), source_inventory_left(src_id))
+            if possible > 0:
+                actual_sends.append((src_id, angle, turns, possible))
+                total_possible += possible
+                
+        if total_possible < missing:
             continue
-        planned_commitments[target.id].extend(committed)
+            
+        committed = []
+        for src_id, angle, turns, possible in actual_sends:
+            actual = append_move(src_id, angle, possible)
+            if actual > 0:
+                committed.append((turns, world.player, int(actual)))
+        if committed:
+            planned_commitments[target.id].extend(committed)
 
     # Use leftover attack budget for one more pass after the first commitment
     # wave is fixed.
@@ -2860,7 +2976,10 @@ def plan_moves(world, deadline=None):
                 continue
 
             available_now = source_inventory_left(planet.id)
-            if available_now < policy["reserve"].get(planet.id, 0):
+            # BUGFIX: For doomed planets, the 'reserve' is irrelevant. We should
+            # always try to evacuate all available ships. The original check
+            # was preventing evacuation.
+            if available_now < DOOMED_MIN_SHIPS:
                 continue
 
             best_capture = None
@@ -2965,11 +3084,14 @@ def plan_moves(world, deadline=None):
         ]
         if safe_fronts:
             front_anchor = min(safe_fronts, key=lambda planet: frontier_distance[planet.id])
-            send_ratio = (
-                REAR_SEND_RATIO_FOUR_PLAYER if world.is_four_player else REAR_SEND_RATIO_TWO_PLAYER
-            )
-            if modes["is_finishing"]:
-                send_ratio = max(send_ratio, REAR_SEND_RATIO_FOUR_PLAYER)
+            if world.is_late:
+                send_ratio = 0.88  # Funnel almost everything in late game
+            elif modes["is_finishing"]:
+                send_ratio = 0.78
+            elif world.is_four_player:
+                send_ratio = REAR_SEND_RATIO_FOUR_PLAYER
+            else:
+                send_ratio = REAR_SEND_RATIO_TWO_PLAYER
 
             for rear in sorted(world.my_planets, key=lambda planet: -frontier_distance[planet.id]):
                 if expired():

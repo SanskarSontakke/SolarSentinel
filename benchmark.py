@@ -17,6 +17,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 import importlib.util
 
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+except ImportError:
+    plt = None
+    mticker = None
+
 # Force silence
 logging.disable(logging.INFO)
 warnings.filterwarnings("ignore")
@@ -43,13 +50,21 @@ def wilson_interval(wins: int, total: int):
 
 def run_single_game(args_tuple):
     """Worker function for parallel execution."""
-    mode, agents_paths, game_idx, seed = args_tuple
+    mode, agents_paths, game_idx, seed, verbose = args_tuple
     from kaggle_environments import make
     
     # Reload agents in child process
     agents = [load_agent(p) for p in agents_paths]
     
-    env = make("orbit_wars", debug=False)
+    log_buffer = []
+    total_actions = [0] * len(agents)
+    
+    if verbose:
+        log_buffer.append(f"========================================")
+        log_buffer.append(f"=== STARTED GAME {game_idx:3d} ===")
+        log_buffer.append(f"========================================")
+        
+    env = make("orbit_wars", debug=verbose)
     # Set seed for reproducibility in sets
     if seed is not None:
         # Note: orbit_wars might not respect a global seed easily, but we try
@@ -58,6 +73,32 @@ def run_single_game(args_tuple):
     env.run(agents)
     final = env.steps[-1]
     
+    # Collect move history for diagnostics
+    # Format: {turn_idx: {player_idx: [moves]}}
+    move_history = {}
+    
+    for i, step in enumerate(env.steps):
+        turn_actions = {}
+        action_summaries = []
+        for p_idx, player_data in enumerate(step):
+            action = player_data.get("action")
+            if action:
+                turn_actions[p_idx] = action
+                action_summaries.append(f"P{p_idx} moves: {len(action)}")
+                total_actions[p_idx] += len(action)
+            if player_data.get("status") == "ERROR" and verbose:
+                log_buffer.append(f"[Game {game_idx}] [ERROR] Step {i}, P{p_idx} crashed! Check output above.")
+        if turn_actions:
+            move_history[i] = turn_actions
+            
+        if verbose and (turn_actions or i % 10 == 0 or i == len(env.steps) - 1):
+            obs = step[0].observation
+            planets = obs.planets if hasattr(obs, "planets") else obs.get("planets", [])
+            ships = [0] * len(agents)
+            for p in planets:
+                if p[1] != -1: ships[p[1]] += p[5]
+            log_buffer.append(f"[Game {game_idx}] Step {i:3d} | Ships: {ships} | Actions: {', '.join(action_summaries) if action_summaries else 'None'}")
+
     # Rewards and ships
     rewards = [s.reward or 0 for s in final]
     obs = final[0].observation
@@ -76,17 +117,95 @@ def run_single_game(args_tuple):
     
     winner_idx = winners[0] if winners else -1
     
+    if verbose:
+        summary_log = [f"\n--- GAME {game_idx} SUMMARY ---", f"Winner: P{winner_idx}", f"Steps:  {len(env.steps) - 1}"]
+        for p_idx in range(len(agents)):
+            summary_log.append(f"  P{p_idx} | Final Ships: {ship_counts[p_idx]:4d} | Total Actions: {total_actions[p_idx]}")
+        summary_log.append(f"========================================\n")
+        print("\n".join(summary_log))
+        
     return {
         "game_idx": game_idx,
         "rewards": rewards,
         "ships": ship_counts,
         "winner": winner_idx,
-        "steps": len(env.steps) - 1
+        "steps": len(env.steps) - 1,
+        "move_history": move_history,
+        "total_actions": total_actions,
+        "verbose_log": log_buffer if verbose else []
     }
+
+def create_visualizations(results_path: Path, output_dir: Path):
+    """
+    Analyzes benchmark_results.json and generates insightful charts.
+    """
+    if plt is None:
+        print("\n[WARN] Matplotlib is required for generating charts.")
+        print("       Please install it using: pip install matplotlib")
+        return
+
+    if not results_path.exists():
+        print(f"Error: Benchmark results not found at '{results_path}'")
+        return
+
+    with open(results_path, 'r') as f:
+        data = json.load(f)
+
+    output_dir.mkdir(exist_ok=True)
+    print(f"\nSaving charts to: {output_dir.resolve()}")
+
+    num_games = data.get("games", 0)
+    games = data.get("results", [])
+    if not games or num_games == 0:
+        print("No game results found in the file.")
+        return
+
+    num_players = len(games[0].get("rewards", []))
+    player_names = [f"Player {i}" for i in range(num_players)]
+
+    # 1. Win Rate Pie Chart
+    wins = data.get("wins", [0] * num_players)
+    fig, ax = plt.subplots(figsize=(8, 8), facecolor='#f0f0f0')
+    ax.set_facecolor('#f0f0f0')
+    explode = [0.05 if w == max(wins) and max(wins) > 0 else 0 for w in wins]
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, num_players))
+    wedges, texts, autotexts = ax.pie(wins, labels=player_names, autopct=lambda p: f'{p * num_games / 100:.0f} wins\n({p:.1f}%)' if p > 0 else '', startangle=90, explode=explode, colors=colors, wedgeprops={'edgecolor': 'white', 'linewidth': 1.5})
+    plt.setp(autotexts, size=10, weight="bold", color="white")
+    plt.setp(texts, size=12)
+    ax.set_title(f'Win Rate Distribution ({num_games} Games)', size=16, weight="bold", pad=20)
+    plt.savefig(output_dir / "win_rate.png", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  - Saved win rate chart: win_rate.png")
+
+    # 2. Average Final Ships & Actions Bar Charts
+    total_ships = np.zeros(num_players)
+    total_actions = np.zeros(num_players)
+    for game in games:
+        total_ships += np.array(game.get("ships", [0] * num_players))
+        total_actions += np.array(game.get("total_actions", [0] * num_players))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), facecolor='#f0f0f0')
+    fig.suptitle('Average Game Statistics', size=18, weight='bold')
+    bars1 = ax1.bar(player_names, total_ships / num_games, color=plt.cm.plasma(np.linspace(0.2, 0.8, num_players)))
+    ax1.set_ylabel('Average Ship Count'); ax1.set_title('Final Ships', size=14); ax1.bar_label(bars1, fmt='{:,.0f}'); ax1.yaxis.set_major_formatter(mticker.StrMethodFormatter('{x:,.0f}')); ax1.set_facecolor('#e9e9e9')
+    bars2 = ax2.bar(player_names, total_actions / num_games, color=plt.cm.cividis(np.linspace(0.2, 0.8, num_players)))
+    ax2.set_ylabel('Average Actions Sent'); ax2.set_title('Commands Issued', size=14); ax2.bar_label(bars2, fmt='{:.1f}'); ax2.set_facecolor('#e9e9e9')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(output_dir / "average_stats.png", dpi=150)
+    plt.close(fig)
+    print(f"  - Saved average stats chart: average_stats.png")
 
 def run_benchmark(args):
     t0 = time.time()
     
+    output_folder = ROOT / "benchmark_results"
+    output_folder.mkdir(exist_ok=True)
+    results_file = output_folder / "benchmark_results.json"
+
+    # Clear the results file at the start to ensure clean logs
+    with open(results_file, "w") as f:
+        json.dump({"status": "running", "message": "Benchmark in progress..."}, f)
+
     # Define agent list for the mode
     agent_paths = []
     if args.mode == "2p":
@@ -100,7 +219,7 @@ def run_benchmark(args):
     elif args.mode == "ffa":
         # Custom agent list
         agent_paths = args.agents_list if args.agents_list else [args.agent_a, args.agent_b]
-    
+        
     num_games = 10 if args.quick else args.games
     print("=" * 72)
     print(f"  SolarSentinel Parallel Benchmark (Threads: {args.threads})")
@@ -120,7 +239,7 @@ def run_benchmark(args):
         elif args.mode == "4p_team" and i % 2 == 1:
             current_agents = [agent_paths[1], agent_paths[0], agent_paths[1], agent_paths[0]]
         
-        jobs.append((args.mode, current_agents, i, i))
+        jobs.append((args.mode, current_agents, i, i, args.verbose))
 
     # Run parallel
     with multiprocessing.Pool(args.threads) as pool:
@@ -129,8 +248,12 @@ def run_benchmark(args):
     # Process results
     wins_per_agent = [0] * len(agent_paths)
     team_a_wins, team_b_wins = 0, 0
+    avg_actions = [0] * len(agent_paths)
     
     for i, res in enumerate(results):
+        for p_idx, acts in enumerate(res["total_actions"]):
+            avg_actions[p_idx] += acts
+            
         w = res["winner"]
         # Map winner back to original agent perspective
         if args.mode == "2p":
@@ -157,6 +280,11 @@ def run_benchmark(args):
     for i, wins in enumerate(wins_per_agent):
         p_name = Path(agent_paths[i]).name
         print(f"  P{i} ({p_name}): {wins} wins ({wins/num_games*100:.1f}%)")
+        
+    print(f"\nAverage Actions Per Game:")
+    for i in range(len(agent_paths)):
+        p_name = Path(agent_paths[i]).name
+        print(f"  P{i} ({p_name}): {avg_actions[i]/num_games:.1f} actions")
     
     # Save results
     output = {
@@ -166,8 +294,11 @@ def run_benchmark(args):
         "wins": wins_per_agent if args.mode != "4p_team" else [team_a_wins, team_b_wins],
         "results": results
     }
-    with open("benchmark_results.json", "w") as f:
+    
+    with open(results_file, "w") as f:
         json.dump(output, f, indent=2)
+        
+    create_visualizations(results_file, output_folder)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -178,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--agents-list", nargs="+", help="Explicit list of 4 agent paths for FFA")
+    parser.add_argument("--verbose", action="store_true", help="Print per-move statistics and errors for debugging")
     args = parser.parse_args()
     
     # Multiprocessing fix for kaggle_environments
