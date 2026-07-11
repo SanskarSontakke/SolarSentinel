@@ -1,2 +1,24 @@
-/__pycache__
-/snapshots/__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Generated outputs
+/snapshots/
+/benchmark_results/
+*.png
+*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
